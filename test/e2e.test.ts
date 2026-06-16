@@ -250,7 +250,7 @@ test('list and defs reflect created instances', () => {
   const db = tmpDb();
   const ow = makeCli(db);
 
-  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), ['delivery', 'research', 'routing']);
+  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), ['delivery', 'intake', 'research', 'routing']);
   assert.deepEqual(ow('list'), []);
 
   const wf = ow('create', 'delivery', '--title', 'Dark mode', '--provide', `proposal=${JSON.stringify({ text: 'x' })}`).workflow;

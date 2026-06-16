@@ -19,12 +19,13 @@ import { dirname, join } from 'node:path';
 const ROOT = join(import.meta.dirname, '..');
 const BIN = join(ROOT, 'bin', 'oweflow.mjs');
 const FIXTURES = join(ROOT, 'test', 'fixtures');
+const EXAMPLES = join(ROOT, 'examples', 'workflows');
 
-/** A throwing CLI bound to a fresh temp db + the fixtures defs, plus `.raw`. */
-function harness() {
+/** A throwing CLI bound to a fresh temp db + a defs dir (fixtures by default), plus `.raw`. */
+function harness(defsDir: string = FIXTURES) {
   const db = join(mkdtempSync(join(tmpdir(), 'oweflow-schema-')), 'state.db');
   const run = (...args: string[]) =>
-    spawnSync(process.execPath, [BIN, ...args, '--db', db, '--defs', FIXTURES], { encoding: 'utf8' });
+    spawnSync(process.execPath, [BIN, ...args, '--db', db, '--defs', defsDir], { encoding: 'utf8' });
   const ow = (...args: string[]): any => {
     const r = run(...args);
     if (r.status !== 0) throw new Error(`oweflow ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
@@ -176,5 +177,56 @@ test('schema e2e: a schema-violating provide is refused (seedOwed input via the 
   const ow = harness();
   const wf = ow('create', 'schemacheck', '--provide', `spec=${J({ goal: 'ok' })}`).workflow;
   assert.ok(ow('status', wf).eligible.some((f: any) => f.loop === 'planner'));
+  ow.cleanup();
+});
+
+// The bundled `intake` example (examples/workflows/intake.yaml) is the user-facing
+// demonstration of §18. Drive its documented header walkthrough verbatim against
+// the real examples dir so the example — and the commands its comment promises —
+// can't silently rot.
+test('schema e2e: the bundled `intake` example runs its documented walkthrough', () => {
+  const ow = harness(EXAMPLES);
+  const wf = ow(
+    'create',
+    'intake',
+    '--provide',
+    `request=${J({ source: 'https://example.com/feed', format: 'json' })}`,
+  ).workflow;
+
+  const parse = claim(ow, wf, 'parse');
+  // the malformed value the header flags as refused really is schema-rejected
+  assert.equal(
+    ow('green', wf, parse.run, 'spec', '--value', J({ endpoint: 'not-a-url' })).outcome,
+    'schema-rejected',
+  );
+  // ...and the conforming one greens on the same open run
+  assert.equal(
+    ow('green', wf, parse.run, 'spec', '--value', J({ endpoint: 'https://example.com/feed', limit: 50 })).outcome,
+    'green',
+  );
+  ow('close', wf, parse.run);
+
+  const fetch = claim(ow, wf, 'fetch');
+  // one malformed element refuses the whole emit atomically
+  const bad = ow('emit', wf, fetch.run, '--items', J([{ id: 'a1', title: 'First' }, { bogus: 1 }]));
+  assert.equal(bad.outcome, 'schema-rejected');
+  assert.deepEqual(bad.created, []);
+  // the clean emit then accretes both elements
+  const emit = ow('emit', wf, fetch.run, '--items', J([{ id: 'a1', title: 'First' }, { id: 'a2', title: 'Second' }]));
+  assert.equal(emit.outcome, 'emitted');
+  assert.deepEqual(emit.created, ['fetch.record[0]', 'fetch.record[1]']);
+  ow('seal', wf, fetch.run);
+  ow('close', wf, fetch.run);
+
+  const index = claim(ow, wf, 'index');
+  assert.equal(ow('green', wf, index.run, 'report', '--value', J({ count: 2 })).outcome, 'green');
+  ow('close', wf, index.run);
+
+  assert.equal(ow('status', wf).done, true);
+
+  // and a schema-violating request is refused at create (non-zero exit)
+  const r = ow.raw('create', 'intake', '--provide', `request=${J({ format: 'xml' })}`);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /input 'request' failed schema/);
   ow.cleanup();
 });

@@ -111,7 +111,11 @@ npm run check     # typecheck + full test suite
 
 ## Quick start
 
-The two bundled examples live in [`examples/workflows`](examples/workflows). Point
+The bundled examples live in [`examples/workflows`](examples/workflows), each
+demonstrating one idea: [`delivery`](examples/workflows/delivery.yaml)
+(knock-backs), [`research`](examples/workflows/research.yaml) (collections),
+[`routing`](examples/workflows/routing.yaml) (skip-cascade), and
+[`intake`](examples/workflows/intake.yaml) (schema validation, §18). Point
 oweflow at them and drive one end to end. Every data command prints JSON, so the
 snippet below pipes through `jq`.
 
@@ -147,8 +151,10 @@ Do it past `builder`'s `maxAttempts` and `pr` **stalls**; `oweflow retry $wf pr
 --text "use the new fixture"` clears it.
 
 The [`research`](examples/workflows/research.yaml) example demonstrates the
-collection path (`emit` / `seal` / map / reduce / `retract`); its header comment
-walks through the commands.
+collection path (`emit` / `seal` / map / reduce / `retract`), and
+[`intake`](examples/workflows/intake.yaml) demonstrates **schema validation**
+(§18) — every artifact pins its shape, so a malformed `green`/`emit`/`provide`
+is refused at commit. Each example's header comment walks through the commands.
 
 ---
 
