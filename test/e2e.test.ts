@@ -202,6 +202,35 @@ test('delivery: a PR knocked back to the cap stalls, then `retry` clears it', ()
   rmSync(join(db, '..'), { recursive: true, force: true });
 });
 
+test('a crash-looping producer surfaces failedRuns in status and the bulk status --all', () => {
+  const db = tmpDb();
+  const ow = makeCli(db);
+  const wf = ow('create', 'delivery', '--provide', `proposal=${JSON.stringify({ text: 'x' })}`).workflow;
+
+  // the planner claims and closes `failed` three times without greening — a
+  // crash loop, which §6 never stalls (judgmentRejects stays 0)
+  for (let i = 0; i < 3; i++) {
+    const planner = orderFor(ow('tick', wf), 'planner');
+    ow('close', wf, planner.run, '--outcome', 'failed');
+  }
+
+  const plan = ow('status', wf).debts.find((d: any) => d.path === 'plan');
+  assert.equal(plan.failedRuns, 3, 'single-instance status carries the streak');
+  assert.equal(plan.stalled, false, 'a crash loop is not a §6 judgment stall');
+
+  // the bulk fleet read derives the same per-debt counter in one process
+  const entry = ow('status', '--all').find((e: any) => e.workflow === wf);
+  assert.equal(entry.debts.find((d: any) => d.path === 'plan').failedRuns, 3);
+
+  // a clean close breaks the streak: plan greens, so it is no longer a debt
+  const ok = orderFor(ow('tick', wf), 'planner');
+  ow('green', wf, ok.run, 'plan', '--value', JSON.stringify({ plan: 'v1' }));
+  ow('close', wf, ok.run);
+  assert.equal(ow('status', wf).debts.find((d: any) => d.path === 'plan'), undefined);
+
+  rmSync(join(db, '..'), { recursive: true, force: true });
+});
+
 test('a seedOwed input gates the pipeline until `provide` supplies it', () => {
   const db = tmpDb();
   const ow = makeCli(db);
