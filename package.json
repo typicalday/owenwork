@@ -3,19 +3,50 @@
   "version": "0.1.0",
   "description": "A generic dataflow workflow engine — steps that owe and consume artifacts, advanced by debt and reason-carrying invalidation. Direct better-sqlite3 (WAL + commit-fingerprint CAS).",
   "license": "Apache-2.0",
+  "author": "typicalday",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/typicalday/oweflow.git"
+  },
+  "homepage": "https://github.com/typicalday/oweflow#readme",
+  "bugs": {
+    "url": "https://github.com/typicalday/oweflow/issues"
+  },
+  "keywords": [
+    "workflow",
+    "dataflow",
+    "engine",
+    "sqlite",
+    "orchestration",
+    "dag",
+    "state-machine"
+  ],
   "bin": {
     "oweflow": "bin/oweflow.mjs"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "bin",
+    "examples",
+    "docs"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "oweflow": "node bin/oweflow.mjs",
     "test": "node --test --test-reporter=spec test/*.test.ts",
     "test:quiet": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm run test:quiet"
+    "check": "npm run typecheck && npm run test:quiet",
+    "prepublishOnly": "npm run check"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

@@ -107,6 +107,18 @@ npm install
 npm run check     # typecheck + full test suite
 ```
 
+Or consume it as a dependency — oweflow ships its TypeScript source (no build
+step), so the importing project just needs a Node ≥ 22.6 ESM host with
+type-stripping (on by default in 23.6+):
+
+```sh
+npm install oweflow
+```
+
+```ts
+import { createEngine } from 'oweflow';   // see "Programmatic / embedding" below
+```
+
 ---
 
 ## Quick start
