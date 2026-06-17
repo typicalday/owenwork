@@ -20,12 +20,16 @@ import {
 import { DEBT_STATES, SETTLED_STATES } from './types.ts';
 import type {
   Acceptance,
+  ArtifactBiography,
   ArtifactData,
   ConsumePattern,
   Fingerprint,
   LoopDef,
   ProducePattern,
+  RunData,
+  TimelineEvent,
   WorkflowDef,
+  WorkflowTrace,
 } from './types.ts';
 
 export type ArtifactMap = ReadonlyMap<string, ArtifactData>;
@@ -65,17 +69,17 @@ export function loopMode(loop: LoopDef): LoopMode {
   return 'plain';
 }
 
-function mapProduce(loop: LoopDef): ProducePattern | undefined {
+export function mapProduce(loop: LoopDef): ProducePattern | undefined {
   return loop.produces.find((p) => p.kind === 'map');
 }
 /** The collection stem a loop produces (`gather.source` for `gather.source[]`), if any. */
 export function collectionStem(loop: LoopDef): string | undefined {
   return loop.produces.find((p) => p.kind === 'collection')?.stem;
 }
-function singletonProduces(loop: LoopDef): ProducePattern[] {
+export function singletonProduces(loop: LoopDef): ProducePattern[] {
   return loop.produces.filter((p) => p.kind === 'singleton');
 }
-function collectionProduces(loop: LoopDef): ProducePattern[] {
+export function collectionProduces(loop: LoopDef): ProducePattern[] {
   return loop.produces.filter((p) => p.kind === 'collection');
 }
 
@@ -509,3 +513,128 @@ function blockingInputs(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): str
 }
 
 export { SETTLED_STATES };
+
+// ---- trace builder (§17 derived temporal view) --------------------------------
+
+/**
+ * Build a causal timeline and per-artifact biographies for one workflow
+ * instance. Pure — no DB, no clock, no IO. Same purity contract as
+ * workflowStatus.
+ *
+ * Causality gap: a successful run does not append a ReasonEntry and there is
+ * no stored FK from an artifact version back to its producing run. The
+ * produced→consumed edges are therefore inferred (see WorkflowTrace.inferenceNote),
+ * not stored facts. We represent this honestly: producedStems is derived from
+ * the def (structural, not temporal) and consumedInputs is from the run
+ * fingerprint (a stored fact at claim time).
+ */
+export function buildTrace(
+  def: WorkflowDef,
+  artifacts: ReadonlyArray<ArtifactData & { updatedAt?: number }>,
+  runs: ReadonlyArray<RunData & { id: string; createdAt: number; updatedAt: number }>,
+): WorkflowTrace {
+  // --- step 1: build an ArtifactMap for workflowStatus reuse ---
+  const artMap: ArtifactMap = new Map(artifacts.map((a) => [a.path, a]));
+
+  // --- step 2: build the loop → producedStems map from the def ---
+  // For map loops: the raw produce pattern string (e.g. "gather.source[$i].formatcheck")
+  // For collection producers: the collection stem (e.g. "gather.source")
+  // For singletons: the stem name (e.g. "plan", "pr")
+  const loopProducedStems = new Map<string, string[]>();
+  for (const loop of def.loops) {
+    const stems: string[] = [];
+    for (const p of singletonProduces(loop)) stems.push(p.stem);
+    for (const p of collectionProduces(loop)) stems.push(p.stem);
+    const mp = mapProduce(loop);
+    if (mp) stems.push(mp.raw); // use the raw pattern (e.g. "gather.source[$i].check")
+    loopProducedStems.set(loop.name, stems);
+  }
+
+  // --- step 3: build the timeline ---
+  // Runs are already ordered by (created_at, rowid) from store.listRuns.
+  // We re-sort here defensively in case caller passes unsorted input.
+  const sortedRuns = [...runs].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; // id tiebreak (lexicographic, stable)
+  });
+
+  const timeline: TimelineEvent[] = sortedRuns.map((run, idx) => ({
+    seq: idx + 1,
+    at: run.createdAt,
+    endedAt: run.updatedAt,
+    loop: run.loop,
+    key: run.key ?? '',
+    outcome: run.outcome,
+    summary: run.summary,
+    sessionId: run.sessionId,
+    consumedInputs: run.fingerprint,
+    producedStems: loopProducedStems.get(run.loop) ?? [],
+  }));
+
+  // --- step 4: build artifact biographies ---
+  // Count actions across all artifact reason threads for the summary.
+  let totalRejects = 0;
+  let totalRetries = 0;
+  const stalledArtifacts: string[] = [];
+
+  const biographies: ArtifactBiography[] = [...artifacts]
+    .sort((a, b) => a.path.localeCompare(b.path))
+    .map((art) => {
+      for (const e of art.reasons) {
+        if (e.action === 'reject' || e.action === 'born-rejected' || e.action === 'schema-reject') {
+          totalRejects++;
+        }
+        if (e.action === 'retry') totalRetries++;
+      }
+
+      // Check stall: need the producer loop's caps
+      const producerLoop = def.loops.find((l) => l.name === art.producer);
+      if (producerLoop) {
+        const stallJ = isStalled(art, producerLoop.maxAttempts);
+        const stallS = isSchemaStalled(art, producerLoop.maxSchemaFailures);
+        if (stallJ || stallS) stalledArtifacts.push(art.path);
+      }
+
+      return {
+        path: art.path,
+        producer: art.producer,
+        terminal: art.terminal ?? false,
+        acceptance: art.acceptance,
+        version: art.version,
+        judgmentRejects: art.judgmentRejects,
+        schemaRejects: art.schemaRejects,
+        events: art.reasons, // already chronological (append-only thread)
+      };
+    });
+
+  // --- step 5: summary ---
+  const byOutcome: Record<string, number> = {};
+  for (const run of sortedRuns) {
+    const k = run.outcome ?? 'open';
+    byOutcome[k] = (byOutcome[k] ?? 0) + 1;
+  }
+
+  const status = workflowStatus(def, artMap);
+
+  return {
+    workflow: artifacts[0]?.workflow ?? '',
+    timeline,
+    artifacts: biographies,
+    summary: {
+      totalRuns: sortedRuns.length,
+      byOutcome,
+      totalRejects,
+      totalRetries,
+      stalledArtifacts,
+      done: status.done,
+    },
+    inferenceNote:
+      'producedStems is derived from the workflow definition (structural) and ' +
+      'identifies which stems a loop is responsible for, not which version it ' +
+      'produced in a specific run. consumedInputs is the run fingerprint (a ' +
+      'stored fact at claim time). The causal edge run→artifact-version is an ' +
+      'inference: the Nth ok run of loop L corresponds to version N of its ' +
+      "output stems. This is a heuristic — no stored FK exists (by design, " +
+      "to avoid schema changes).",
+  };
+}

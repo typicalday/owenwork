@@ -379,3 +379,65 @@ test('oweflow lint exits 0 when a def has warnings but no errors', () => {
   assert.ok(warned.warnings.length > 0, 'has at least one warning');
   assert.deepEqual(warned.errors, []);
 });
+
+// ---- trace command ----------------------------------------------------------
+
+test('trace outputs valid JSON with timeline and artifacts fields', () => {
+  const { run } = makeCli();
+
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // Run the planner so there is at least one run in the history
+  const plannerOrder = run('tick', wf).json().orders[0];
+  assert.ok(plannerOrder);
+  run('green', wf, plannerOrder.run, 'plan', '--value', J({ plan: 'v1' }));
+  run('close', wf, plannerOrder.run);
+
+  const r = run('trace', wf);
+  assert.equal(r.code, 0, r.err);
+  const trace = r.json();
+  assert.ok(Array.isArray(trace.timeline), 'has timeline array');
+  assert.ok(Array.isArray(trace.artifacts), 'has artifacts array');
+  assert.ok(trace.timeline.length >= 1, 'timeline has at least one event');
+  assert.equal(trace.timeline[0].loop, 'planner');
+  assert.equal(trace.timeline[0].seq, 1);
+  assert.ok(typeof trace.summary.done === 'boolean');
+});
+
+test('trace --format text is non-empty and contains a loop name and outcome', () => {
+  const { run } = makeCli();
+
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  const plannerOrder = run('tick', wf).json().orders[0];
+  run('green', wf, plannerOrder.run, 'plan', '--value', J({ plan: 'v1' }));
+  run('close', wf, plannerOrder.run);
+
+  const r = run('trace', wf, '--format', 'text');
+  assert.equal(r.code, 0, r.err);
+  assert.ok(r.out.length > 0, 'text output is non-empty');
+  assert.match(r.out, /planner/, 'output contains loop name "planner"');
+  assert.match(r.out, /ok/, 'output contains outcome "ok"');
+  assert.match(r.out, /Timeline/, 'output contains Timeline header');
+  assert.match(r.out, /Artifacts/, 'output contains Artifacts header');
+});
+
+test('trace on a workflow with no runs still succeeds with empty timeline', () => {
+  const { run } = makeCli();
+
+  // Create but never tick — no runs at all
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const r = run('trace', wf);
+  assert.equal(r.code, 0);
+  const trace = r.json();
+  assert.deepEqual(trace.timeline, [], 'no runs means empty timeline');
+  assert.ok(Array.isArray(trace.artifacts), 'artifacts still present');
+  assert.equal(trace.summary.totalRuns, 0);
+});
+
+test('trace exits 1 when workflow argument is missing', () => {
+  const { run } = makeCli();
+  const r = run('trace');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /missing required argument: workflow/);
+});

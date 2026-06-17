@@ -534,6 +534,21 @@ export class Store {
     }
     return n;
   }
+
+  /**
+   * All runs for a workflow instance, ordered by created_at then rowid for a
+   * stable insertion-order tiebreak (consistent with recentFailedRuns and the
+   * run_wf_loop index). The rowid tiebreak matters in test environments where
+   * nowMs() may not advance between successive insertions.
+   */
+  listRuns(workflow: string): RunRow[] {
+    const rows = this.db
+      .prepare(
+        'SELECT * FROM run WHERE workflow = ? ORDER BY created_at, rowid',
+      )
+      .all(workflow) as RunRowRaw[];
+    return rows.map(mapRun);
+  }
 }
 
 /** Open (creating if needed) a store at `path`. */

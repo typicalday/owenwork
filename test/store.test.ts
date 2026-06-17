@@ -191,3 +191,31 @@ test('deleteWorkflow cascades to artifacts/tasks/runs', () => {
   assert.equal(s.countRuns(wf, 'build', 0), 0);
   s.close();
 });
+
+test('listRuns returns all runs for a workflow ordered by created_at, rowid', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const wf2 = randId('wf');
+
+  // Insert runs with explicit timestamps to verify ordering
+  const r1 = randId('run');
+  const r2 = randId('run');
+  const r3 = randId('run');
+  s.insertRun(r1, { workflow: wf, loop: 'planner', key: '' }, 1000);
+  s.insertRun(r2, { workflow: wf, loop: 'builder', key: '' }, 2000);
+  s.insertRun(r3, { workflow: wf2, loop: 'other', key: '' }, 500); // different wf — must not appear
+
+  // Close r1 with ok outcome so round-trip is verified
+  s.updateRun(r1, { outcome: 'ok', fingerprint: { proposal: 1 } });
+
+  const runs = s.listRuns(wf);
+  assert.equal(runs.length, 2, 'only runs for wf, not wf2');
+  assert.equal(runs[0]!.id, r1, 'ordered by created_at: r1 first');
+  assert.equal(runs[1]!.id, r2, 'r2 second');
+  assert.equal(runs[0]!.loop, 'planner');
+  assert.equal(runs[0]!.outcome, 'ok');
+  assert.deepEqual(runs[0]!.fingerprint, { proposal: 1 });
+  assert.equal(runs[1]!.outcome, undefined, 'open run has undefined outcome');
+
+  s.close();
+});

@@ -33,10 +33,14 @@ export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 export { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from './defs.ts';
 
 export {
+  buildTrace,
+  collectionProduces,
   eligibleFirings,
   isSchemaStalled,
   isStalled,
   maintainDecisions,
+  mapProduce,
+  singletonProduces,
   workflowStatus,
 } from './model.ts';
 export type { ArtifactMap, Blocker, CascadeOp, Firing, WorkflowStatus } from './model.ts';
@@ -52,6 +56,7 @@ export type { SchemaCheck, SchemaIssue } from './schema.ts';
 export { DEBT_STATES, SETTLED_STATES } from './types.ts';
 export type {
   Acceptance,
+  ArtifactBiography,
   ArtifactData,
   Author,
   ConsumePattern,
@@ -64,5 +69,7 @@ export type {
   RejectKind,
   RunData,
   TaskData,
+  TimelineEvent,
   WorkflowDef,
+  WorkflowTrace,
 } from './types.ts';

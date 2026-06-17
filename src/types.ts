@@ -180,3 +180,96 @@ export interface InputDef {
   /** optional JSON Schema a provided input value must satisfy (§18) */
   schema?: JsonSchema;
 }
+
+// ---- trace types (§17 derived view: temporal causal timeline) ----------------
+
+/**
+ * One chronological event in the workflow's execution history: a single run
+ * from claim to close. The causal links (consumedInputs, producedStems) are
+ * derived from the run's fingerprint and the workflow definition respectively.
+ *
+ * NOTE on causality: `producedStems` is structural (from the def) — we know
+ * which stems this loop is responsible for, but there is no stored FK linking
+ * a specific run to the artifact version it produced. `consumedInputs` is from
+ * the run's fingerprint (what versions of inputs were live at claim time) —
+ * this IS a stored fact. The causal edge "run R produced version N of stem S"
+ * is an inference, not a guarantee; see WorkflowTrace.inferenceNote.
+ */
+export interface TimelineEvent {
+  seq: number;               // 1-based sequence number, stable across renders
+  at: number;                // run.createdAt (ms since epoch)
+  endedAt: number;           // run.updatedAt (ms since epoch, last mutation)
+  loop: string;              // loop name
+  key: string;               // binding key ("" for plain/reduce, element path for map)
+  outcome: string | undefined; // 'ok' | 'no_work' | 'failed' | 'skipped' | undefined (open)
+  summary: string | undefined;
+  sessionId: string | undefined;
+  /**
+   * The versions of consumed inputs at claim time (run.fingerprint).
+   * Absent if the run was claimed without a fingerprint (should not happen in
+   * normal operation, but open/zero-output runs may lack one).
+   */
+  consumedInputs: Fingerprint | undefined;
+  /**
+   * The stems this loop is declared to produce (from the def), not from a
+   * stored link. For map loops this is the map pattern stem (e.g.
+   * "gather.source[$i].formatcheck"); for collection producers it is the
+   * collection stem (e.g. "gather.source"); for singletons it is the stem name.
+   * This is structural, not temporal — it tells you what the loop *could*
+   * produce, not which version it produced in this specific run.
+   */
+  producedStems: string[];
+}
+
+/** The lifecycle biography of one artifact: its current state + full event thread. */
+export interface ArtifactBiography {
+  path: string;
+  producer: string;          // loop name
+  terminal: boolean;
+  acceptance: Acceptance;
+  version: number;
+  judgmentRejects: number;
+  schemaRejects: number;
+  /**
+   * The artifact's append-only reason thread, already in chronological order
+   * (each entry was appended at action time; the array is authoritative).
+   * Contains every reject/retract/skip/reopen/retry/born-rejected/schema-reject
+   * that touched this artifact, across all versions.
+   */
+  events: ReasonEntry[];
+}
+
+/** The full derived trace for one workflow instance. */
+export interface WorkflowTrace {
+  workflow: string;
+  /**
+   * Chronological firing log, ordered by run.createdAt then rowid-stable
+   * insertion order (no two rows with the same createdAt should exist in
+   * practice, but the sort is stable: the secondary tiebreak is the run id,
+   * which is a random string — this gives a deterministic ordering even in
+   * test environments where nowMs() does not advance between insertions).
+   */
+  timeline: TimelineEvent[];
+  /** One biography per artifact, ordered by path. */
+  artifacts: ArtifactBiography[];
+  summary: {
+    totalRuns: number;
+    byOutcome: Record<string, number>; // 'ok'|'no_work'|'failed'|'skipped'|'open' → count
+    totalRejects: number;              // sum of all reasons with action 'reject'|'born-rejected'|'schema-reject' across all artifacts
+    totalRetries: number;              // sum of all reasons with action 'retry' across all artifacts
+    stalledArtifacts: string[];        // paths of artifacts that are currently stalled (acceptance=rejected AND judgmentRejects≥producer.maxAttempts OR schemaRejects≥producer.maxSchemaFailures)
+    done: boolean;                     // reuses workflowStatus(def, arts).done
+  };
+  /**
+   * Honest representation of the inference gap: a green run does not append a
+   * ReasonEntry and there is no stored produced_by_run FK. The causal edge
+   * "run R produced version N of artifact A" is inferred by matching:
+   *   - the loop that produced A (from A.producer = run.loop)
+   *   - ordered by run.createdAt — the Nth 'ok' run of loop L is the likely
+   *     producer of version N of that loop's output
+   * This is a heuristic and not guaranteed to be correct in the presence of
+   * concurrent processes or clock skew. Do not rely on it for correctness
+   * decisions; it is provided only for human readability.
+   */
+  inferenceNote: string;
+}

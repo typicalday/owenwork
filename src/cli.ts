@@ -31,6 +31,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
+import { buildTrace } from './model.ts';
 import { openStore } from './store.ts';
 import type { Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw } from './defs.ts';
@@ -188,6 +189,7 @@ Commands:
   status <wf>                            derive debts / eligible / blocked
   status --all                           every instance's status in one call (fleet read)
   show <wf>                              dump raw artifacts
+  trace <wf> [--format text]             causal timeline + artifact biographies
   list                                   list workflow instances
   green <wf> <run> <path> [--value json] [--terminal]
   emit <wf> <run> --items '[{...}]'      accrete collection elements
@@ -301,6 +303,54 @@ function dispatch(command: string, io: CliIO, args: Args): void {
       case 'show': {
         const wf = need(args, 1, 'workflow');
         print(io, store.listArtifacts(wf));
+        return;
+      }
+      case 'trace': {
+        const wf = need(args, 1, 'workflow');
+        const format = last(args, 'format') ?? 'json';
+        const artifacts = store.listArtifacts(wf);
+        const runs = store.listRuns(wf);
+
+        // Resolve the def — need the workflow row to get the definition name.
+        const wfRow = store.getWorkflow(wf);
+        if (!wfRow) throw new CliError(`workflow not found: ${wf}`);
+        const def = ctx.defs.get(wfRow.def);
+        if (!def) throw new CliError(`unknown workflow definition '${wfRow.def}' (looked in ${ctx.defsDir})`);
+
+        const trace = buildTrace(def, artifacts, runs);
+
+        if (format === 'text') {
+          // --- compact human-readable rendering ---
+          io.out('=== Timeline ===');
+          for (const ev of trace.timeline) {
+            const ts = new Date(ev.at).toISOString();
+            const keyPart = ev.key ? `[${ev.key}]` : '';
+            const consumed = ev.consumedInputs
+              ? JSON.stringify(ev.consumedInputs)
+              : '(no fingerprint)';
+            const produced = ev.producedStems.join(', ') || '(none)';
+            io.out(`#${ev.seq} ${ts} ${ev.loop}${keyPart} ${ev.outcome ?? 'open'} — consumed ${consumed} produced [${produced}]`);
+            if (ev.summary) io.out(`    summary: ${ev.summary}`);
+          }
+          io.out('');
+          io.out('=== Artifacts ===');
+          for (const art of trace.artifacts) {
+            io.out(`${art.path}  (${art.acceptance}, v${art.version}, producer: ${art.producer})`);
+            if (art.events.length === 0) {
+              io.out('  (no lifecycle events)');
+            } else {
+              for (const ev of art.events) {
+                const ts = new Date(ev.at).toISOString();
+                io.out(`  ${ts}  ${ev.action}  by:${ev.by}  "${ev.text}"`);
+              }
+            }
+          }
+          io.out('');
+          io.out(`=== Summary: ${trace.summary.totalRuns} runs, done=${trace.summary.done} ===`);
+        } else {
+          // default: JSON
+          print(io, trace);
+        }
         return;
       }
       case 'list': {
