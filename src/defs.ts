@@ -26,7 +26,7 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { InputDef, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -62,6 +62,7 @@ interface RawDef {
   description?: unknown;
   inputs?: unknown;
   loops?: unknown;
+  invariants?: unknown;
 }
 
 // ---- defaults ----------------------------------------------------------------
@@ -131,6 +132,87 @@ function parseProduces(v: unknown, ctx: string): ProducePattern[] {
 
 export class DefError extends Error {}
 
+// ---- invariant helpers -------------------------------------------------------
+
+/** Collect every stem referenced by `path` atoms in a predicate tree. */
+function collectPredicateStems(pred: InvariantPredicate): string[] {
+  if ('path' in pred) return [pred.path];
+  if ('state' in pred) return [];
+  if ('all' in pred) return pred.all.flatMap(collectPredicateStems);
+  if ('any' in pred) return pred.any.flatMap(collectPredicateStems);
+  return collectPredicateStems(pred.not); // 'not'
+}
+
+// Allowed `is` literals for path atoms
+const ALLOWED_IS = new Set<string>([
+  'owed', 'green', 'rejected', 'retracted', 'skipped', 'present', 'absent',
+]);
+
+/** Parse a raw object into an InvariantPredicate, throwing DefError on shape errors. */
+function parseInvariantPredicate(v: unknown, ctx: string): InvariantPredicate {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new DefError(`${ctx} must be a predicate object`);
+  }
+  const obj = v as Record<string, unknown>;
+  const discriminants = (['path', 'state', 'all', 'any', 'not'] as const).filter((k) => k in obj);
+  if (discriminants.length === 0) {
+    throw new DefError(`${ctx} must have exactly one of: path, state, all, any, not (got none)`);
+  }
+  if (discriminants.length > 1) {
+    throw new DefError(`${ctx} must have exactly one of: path, state, all, any, not (got: ${discriminants.join(', ')})`);
+  }
+  const key = discriminants[0]!;
+  if (key === 'path') {
+    const path = asString(obj['path'], `${ctx}.path`);
+    const is = asString(obj['is'], `${ctx}.is`);
+    if (!ALLOWED_IS.has(is)) {
+      throw new DefError(`${ctx}.is must be one of: ${[...ALLOWED_IS].join(', ')} (got '${is}')`);
+    }
+    return { path, is: is as Acceptance | 'present' | 'absent' };
+  }
+  if (key === 'state') {
+    if (obj['state'] !== 'done') throw new DefError(`${ctx}.state must be 'done'`);
+    return { state: 'done' };
+  }
+  if (key === 'all') {
+    if (!Array.isArray(obj['all'])) throw new DefError(`${ctx}.all must be an array`);
+    return { all: (obj['all'] as unknown[]).map((item, i) => parseInvariantPredicate(item, `${ctx}.all[${i}]`)) };
+  }
+  if (key === 'any') {
+    if (!Array.isArray(obj['any'])) throw new DefError(`${ctx}.any must be an array`);
+    return { any: (obj['any'] as unknown[]).map((item, i) => parseInvariantPredicate(item, `${ctx}.any[${i}]`)) };
+  }
+  // key === 'not'
+  return { not: parseInvariantPredicate(obj['not'], `${ctx}.not`) };
+}
+
+/** Parse a raw invariants array into InvariantDef[], throwing DefError on shape errors. */
+function parseInvariants(v: unknown, ctx: string): InvariantDef[] {
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) throw new DefError(`${ctx} must be a list`);
+  return v.map((item, i) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      throw new DefError(`${ctx}[${i}] must be a mapping`);
+    }
+    const raw = item as Record<string, unknown>;
+    const name = asString(raw['name'], `${ctx}[${i}].name`);
+    if (!('requires' in raw)) {
+      throw new DefError(`${ctx}[${i}] ('${name}') must have a 'requires' predicate`);
+    }
+    const inv: InvariantDef = {
+      name,
+      requires: parseInvariantPredicate(raw['requires'], `invariant '${name}'.requires`),
+    };
+    if (raw['description'] !== undefined) {
+      inv.description = asString(raw['description'], `invariant '${name}'.description`);
+    }
+    if (raw['when'] !== undefined) {
+      inv.when = parseInvariantPredicate(raw['when'], `invariant '${name}'.when`);
+    }
+    return inv;
+  });
+}
+
 // ---- parse + build -----------------------------------------------------------
 
 /**
@@ -170,6 +252,8 @@ export function buildDef(raw: unknown, source?: string): WorkflowDef {
   const def: WorkflowDef = { name, inputs, loops };
   if (r.title !== undefined) def.title = asString(r.title, 'title');
   if (r.description !== undefined) def.description = asString(r.description, 'description');
+  const invariants = parseInvariants(r.invariants, 'invariants');
+  if (invariants.length > 0) def.invariants = invariants;
   return def;
 }
 
@@ -300,6 +384,25 @@ export function validateDef(def: WorkflowDef): string[] {
   errors.push(...reachabilityErrors(def, danglingLoops));
 
   errors.push(...detectCycles(def, producerOf, collectionStems));
+
+  // Semantic invariant validation: unknown stem references and duplicate names.
+  if (def.invariants && def.invariants.length > 0) {
+    const invariantNames = new Set<string>();
+    for (const inv of def.invariants) {
+      if (invariantNames.has(inv.name)) {
+        errors.push(`invariant name '${inv.name}' is declared more than once`);
+      }
+      invariantNames.add(inv.name);
+      const stems = collectPredicateStems(inv.requires);
+      if (inv.when) stems.push(...collectPredicateStems(inv.when));
+      for (const stem of stems) {
+        if (!producerOf.has(stem)) {
+          errors.push(`invariant '${inv.name}' references unknown stem '${stem}' (not an input or produced artifact)`);
+        }
+      }
+    }
+  }
+
   return errors;
 }
 

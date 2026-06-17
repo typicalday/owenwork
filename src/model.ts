@@ -30,6 +30,7 @@ import type {
   GraphEdge,
   GraphNode,
   GraphNodeState,
+  InvariantPredicate,
   LoopDef,
   ProducePattern,
   RunData,
@@ -520,6 +521,32 @@ function blockingInputs(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): str
 }
 
 export { SETTLED_STATES };
+
+// ---- invariant evaluation ---------------------------------------------------
+
+/** A trivially-true predicate sentinel for `when` defaulting ({all:[]} = empty AND = true). */
+const ALWAYS_TRUE: InvariantPredicate = { all: [] };
+
+/**
+ * Pure evaluation of a structured invariant predicate against artifact state.
+ * Total — never throws on well-formed (validated) predicates.
+ */
+export function evalInvariantPredicate(
+  pred: InvariantPredicate,
+  arts: ReadonlyMap<string, ArtifactData>,
+  status: WorkflowStatus,
+): boolean {
+  if ('path' in pred) {
+    const { path, is } = pred;
+    if (is === 'present') return arts.has(path);
+    if (is === 'absent') return !arts.has(path);
+    return arts.get(path)?.acceptance === is;
+  }
+  if ('state' in pred) return status.done;
+  if ('all' in pred) return pred.all.every((p) => evalInvariantPredicate(p, arts, status));
+  if ('any' in pred) return pred.any.some((p) => evalInvariantPredicate(p, arts, status));
+  return !evalInvariantPredicate(pred.not, arts, status); // 'not'
+}
 
 // ---- trace builder (§17 derived temporal view) --------------------------------
 
@@ -1342,9 +1369,12 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     completable: false,
     completePath: undefined,
     deadLoops: [],
+    invariantViolations: [],
     stats: { statesExplored: 0, depthReached: 0 },
   };
 
+  /** Invariant names already recorded (BFS → first hit is the shortest path). */
+  const reportedInvariants = new Set<string>();
   const firedLoops = new Set<string>();
   let depthReached = 0;
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
@@ -1355,6 +1385,28 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     if (node.depth > depthReached) depthReached = node.depth;
 
     const status = workflowStatus(def, node.arts);
+
+    // ---- invariant checking -------------------------------------------------
+    // A state violates an invariant iff eval(when ?? ALWAYS_TRUE) && !eval(requires).
+    // Checked BEFORE the `done` continue so terminal properties ("when done,
+    // merge must be green") are verified.
+    //
+    // Soundness under bounds: a reported counterexample path was produced by real
+    // applyOutcome/settleInMemory transitions (the same transitions the conformance
+    // test pins to the live Engine). Bounds only cause MISSES, never fabrications —
+    // which is why invariant violations exit non-zero even when bounded (unlike
+    // deadlocks/stuck, which the maxCollectionSize cap can spuriously manufacture).
+    if (def.invariants) {
+      for (const inv of def.invariants) {
+        if (reportedInvariants.has(inv.name)) continue;
+        const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, node.arts, status);
+        if (whenHolds && !evalInvariantPredicate(inv.requires, node.arts, status)) {
+          report.invariantViolations.push({ invariant: inv.name, path: node.path });
+          reportedInvariants.add(inv.name);
+        }
+      }
+    }
+    // -------------------------------------------------------------------------
 
     // Check done
     if (status.done) {

@@ -444,3 +444,155 @@ test('lintDef on the delivery example: no errors, no warnings', () => {
   assert.deepEqual(errors, []);
   assert.deepEqual(warnings, []);
 });
+
+// ---- invariant parsing tests (§3.1 of the declared-invariants build plan) ---
+
+// A minimal base def for invariant tests
+const baseInvariantRaw = {
+  name: 'inv-base',
+  inputs: [{ name: 'proposal' }],
+  loops: [
+    { name: 'planner', consumes: ['proposal'], produces: ['plan'] },
+    { name: 'merger', consumes: ['plan'], produces: ['merge'], terminal: true },
+  ],
+};
+
+// §3.1 test 1: valid invariant round-trips
+test('buildDef: valid invariant round-trips — carries name/requires/when; description absent', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [
+      {
+        name: 'plan-must-be-green-when-done',
+        when: { state: 'done' },
+        requires: { path: 'plan', is: 'green' },
+      },
+    ],
+  };
+  const def = buildDef(raw);
+  assert.ok(def.invariants !== undefined, 'invariants should be present');
+  assert.equal(def.invariants!.length, 1);
+  const inv = def.invariants![0]!;
+  assert.equal(inv.name, 'plan-must-be-green-when-done');
+  assert.deepEqual(inv.when, { state: 'done' });
+  assert.deepEqual(inv.requires, { path: 'plan', is: 'green' });
+  assert.equal(inv.description, undefined);
+});
+
+// §3.1 test 2: missing `requires` → DefError /requires/
+test('buildDef: missing requires → DefError matching /requires/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'broken' }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /requires/.test((e as Error).message));
+});
+
+// §3.1 test 3: invalid `is` literal → DefError /must be one of/
+test('buildDef: invalid is literal → DefError /must be one of/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'bad-is', requires: { path: 'plan', is: 'done' } }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /must be one of/.test((e as Error).message));
+});
+
+// §3.1 test 4: predicate with two discriminants (path + all) → DefError /exactly one of/
+test('buildDef: predicate with two discriminants → DefError /exactly one of/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'multi-disc', requires: { path: 'plan', all: [], is: 'green' } }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /exactly one of/.test((e as Error).message));
+});
+
+// §3.1 test 5: predicate with no discriminants ({}) → DefError /exactly one of.*got none/
+test('buildDef: predicate with no discriminants → DefError /exactly one of.*got none/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'no-disc', requires: {} }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /exactly one of/.test((e as Error).message) && /got none/.test((e as Error).message));
+});
+
+// §3.1 test 6: `all` not an array → DefError /must be an array/
+test('buildDef: all not an array → DefError /must be an array/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'bad-all', requires: { all: 'not-an-array' } }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /must be an array/.test((e as Error).message));
+});
+
+// §3.1 test 7: `any` not an array → DefError /must be an array/
+test('buildDef: any not an array → DefError /must be an array/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'bad-any', requires: { any: 42 } }],
+  };
+  assert.throws(() => buildDef(raw), (e: unknown) => e instanceof DefError && /must be an array/.test((e as Error).message));
+});
+
+// §3.1 test 8: unknown stem → parseDef throws DefError /unknown stem 'nonexistent'/
+test('parseDef: invariant referencing unknown stem → DefError /unknown stem/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [{ name: 'bad-stem', requires: { path: 'nonexistent', is: 'green' } }],
+  };
+  assert.throws(
+    () => parseDef(raw),
+    (e: unknown) => e instanceof DefError && /unknown stem 'nonexistent'/.test((e as Error).message),
+  );
+});
+
+// §3.1 test 9: duplicate invariant names → parseDef throws DefError /declared more than once/
+test('parseDef: duplicate invariant names → DefError /declared more than once/', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [
+      { name: 'dup', requires: { path: 'plan', is: 'green' } },
+      { name: 'dup', requires: { path: 'merge', is: 'green' } },
+    ],
+  };
+  assert.throws(
+    () => parseDef(raw),
+    (e: unknown) => e instanceof DefError && /declared more than once/.test((e as Error).message),
+  );
+});
+
+// §3.1 test 10: invariants: [] is valid; def.invariants absent/empty
+test('buildDef: invariants empty array → def.invariants absent (not set)', () => {
+  const raw = { ...baseInvariantRaw, invariants: [] };
+  const def = buildDef(raw);
+  // parseInvariants returns [] which has length 0, so invariants not set
+  assert.ok(def.invariants === undefined || def.invariants.length === 0, 'invariants should be absent or empty');
+});
+
+// §3.1 test 11: nested not/all round-trips (deep-equal)
+test('buildDef: nested not/all predicate round-trips (deep-equal)', () => {
+  const raw = {
+    ...baseInvariantRaw,
+    invariants: [
+      {
+        name: 'complex',
+        requires: {
+          not: {
+            all: [
+              { path: 'plan', is: 'owed' },
+              { any: [{ path: 'merge', is: 'skipped' }, { state: 'done' }] },
+            ],
+          },
+        },
+      },
+    ],
+  };
+  const def = buildDef(raw);
+  assert.deepEqual(def.invariants![0]!.requires, {
+    not: {
+      all: [
+        { path: 'plan', is: 'owed' },
+        { any: [{ path: 'merge', is: 'skipped' }, { state: 'done' }] },
+      ],
+    },
+  });
+});

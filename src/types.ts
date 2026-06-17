@@ -169,6 +169,8 @@ export interface WorkflowDef {
   inputs: InputDef[];
   loops: LoopDef[];
   dir?: string; // source directory, if loaded from disk
+  /** Declared safety invariants verified by `modelCheck`/`oweflow check`. */
+  invariants?: InvariantDef[];
 }
 
 export interface InputDef {
@@ -359,9 +361,59 @@ export interface CheckReport {
    * (dynamically dead within the bounded search).
    */
   deadLoops: string[];
+  /**
+   * Invariants that are violated in some reachable state. Always present ([]
+   * when no invariants declared or none violated). Each entry is deduplicated by
+   * invariant name — BFS guarantees the stored path is the shortest counterexample.
+   */
+  invariantViolations: InvariantViolation[];
   /** Metadata about the search. */
   stats: {
     statesExplored: number;
     depthReached: number;
   };
+}
+
+// ---- invariant types ---------------------------------------------------------
+
+/**
+ * A structured, total, recursive predicate over artifact state. Exactly one
+ * discriminant key is present per object.
+ *
+ * Safety properties only — no liveness / temporal operators. The bounded BFS
+ * soundly finds safety VIOLATIONS (a reachable witness) but cannot prove
+ * liveness; the existing `completable` covers "a done state is reachable".
+ */
+export type InvariantPredicate =
+  | { path: string; is: Acceptance | 'present' | 'absent' }  // atom: artifact state / presence
+  | { state: 'done' }                                          // true iff workflow is done
+  | { all: InvariantPredicate[] }                              // conjunction (AND)
+  | { any: InvariantPredicate[] }                              // disjunction (OR)
+  | { not: InvariantPredicate };                               // negation
+
+/**
+ * One declared safety invariant. Semantics: "in every reachable state,
+ * `when` (default TRUE) implies `requires`". A state VIOLATES the invariant
+ * iff eval(when ?? TRUE) && !eval(requires).
+ */
+export interface InvariantDef {
+  name: string;
+  description?: string;
+  /** Activation guard. Omitted = always active (TRUE). */
+  when?: InvariantPredicate;
+  /** The property that must hold whenever `when` is true. */
+  requires: InvariantPredicate;
+}
+
+/**
+ * A counterexample: the invariant name + the shortest BFS path from the seed
+ * state to a state that violates the invariant. The path is a real executable
+ * witness — each step was produced by applyOutcome/settleInMemory, the same
+ * transitions the conformance test pins to the live Engine.
+ */
+export interface InvariantViolation {
+  /** The `InvariantDef.name` of the violated invariant. */
+  invariant: string;
+  /** Shortest BFS path of firings from the seed state to the violating state. */
+  path: CheckStep[];
 }

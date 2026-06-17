@@ -20,9 +20,9 @@ import { join } from 'node:path';
 import { Engine } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
-import { applyOutcome, eligibleFirings, settleInMemory, modelCheck } from '../src/model.ts';
+import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
 import { main } from '../src/cli.ts';
-import type { ArtifactData, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
 import { def, input, loop } from './helpers.ts';
 
 // ---- shared workflow definitions (same as engine.test.ts) --------------------
@@ -586,4 +586,365 @@ test('CLI check: completable healthy def (seedOwed=false, maxSchemaFailures: 0) 
   assert.equal(r.code, 0, 'clean exhaustive search → exit 0');
   assert.match(r.out, /Completable: yes/);
   assert.match(r.out, /oweflow check: tiny/);
+});
+
+// ---- Part 4: evalInvariantPredicate unit tests (§3.2) -------------------------
+
+// Helper: minimal WorkflowStatus stubs
+function doneStatus() {
+  return { done: true, debts: [], eligible: [], blocked: [] };
+}
+function notDoneStatus() {
+  return { done: false, debts: [], eligible: [], blocked: [] };
+}
+
+// §3.2 test 12: atom is:'green' true/false
+test('evalInvariantPredicate: atom is:green true/false', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('plan', { workflow: '', path: 'plan', producer: 'p', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const pred: InvariantPredicate = { path: 'plan', is: 'green' };
+  assert.equal(evalInvariantPredicate(pred, arts, notDoneStatus()), true);
+  const pred2: InvariantPredicate = { path: 'plan', is: 'owed' };
+  assert.equal(evalInvariantPredicate(pred2, arts, notDoneStatus()), false);
+});
+
+// §3.2 test 13: atoms owed/rejected/retracted/skipped
+test('evalInvariantPredicate: atoms owed/rejected/retracted/skipped', () => {
+  const make = (acceptance: 'owed' | 'rejected' | 'retracted' | 'skipped') => {
+    const arts = new Map<string, ArtifactData>();
+    arts.set('x', { workflow: '', path: 'x', producer: 'p', acceptance, version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+    return arts;
+  };
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'owed' }, make('owed'), notDoneStatus()), true);
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'rejected' }, make('rejected'), notDoneStatus()), true);
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'retracted' }, make('retracted'), notDoneStatus()), true);
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'skipped' }, make('skipped'), notDoneStatus()), true);
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'green' }, make('owed'), notDoneStatus()), false);
+});
+
+// §3.2 test 14: is:'present' true (in map) / false (absent)
+test('evalInvariantPredicate: is:present true when in map, false when absent', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('x', { workflow: '', path: 'x', producer: 'p', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'present' }, arts, notDoneStatus()), true);
+  assert.equal(evalInvariantPredicate({ path: 'y', is: 'present' }, arts, notDoneStatus()), false);
+});
+
+// §3.2 test 15: is:'absent' inverse
+test('evalInvariantPredicate: is:absent is inverse of present', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('x', { workflow: '', path: 'x', producer: 'p', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  assert.equal(evalInvariantPredicate({ path: 'x', is: 'absent' }, arts, notDoneStatus()), false);
+  assert.equal(evalInvariantPredicate({ path: 'y', is: 'absent' }, arts, notDoneStatus()), true);
+});
+
+// §3.2 test 16: {state:'done'} against done vs not-done workflowStatus
+test('evalInvariantPredicate: state:done against done vs not-done status', () => {
+  const arts = new Map<string, ArtifactData>();
+  assert.equal(evalInvariantPredicate({ state: 'done' }, arts, doneStatus()), true);
+  assert.equal(evalInvariantPredicate({ state: 'done' }, arts, notDoneStatus()), false);
+});
+
+// §3.2 test 17: {all:[]} vacuously true
+test('evalInvariantPredicate: all:[] vacuously true', () => {
+  assert.equal(evalInvariantPredicate({ all: [] }, new Map(), notDoneStatus()), true);
+});
+
+// §3.2 test 18: {any:[]} vacuously false
+test('evalInvariantPredicate: any:[] vacuously false', () => {
+  assert.equal(evalInvariantPredicate({ any: [] }, new Map(), notDoneStatus()), false);
+});
+
+// §3.2 test 19: {all:[...]} AND semantics
+test('evalInvariantPredicate: all:[...] AND semantics', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('a', { workflow: '', path: 'a', producer: 'p', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('b', { workflow: '', path: 'b', producer: 'p', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const pred: InvariantPredicate = { all: [{ path: 'a', is: 'green' }, { path: 'b', is: 'green' }] };
+  assert.equal(evalInvariantPredicate(pred, arts, notDoneStatus()), false); // b is owed
+  const pred2: InvariantPredicate = { all: [{ path: 'a', is: 'green' }, { path: 'a', is: 'present' }] };
+  assert.equal(evalInvariantPredicate(pred2, arts, notDoneStatus()), true);
+});
+
+// §3.2 test 20: {any:[...]} OR semantics
+test('evalInvariantPredicate: any:[...] OR semantics', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('a', { workflow: '', path: 'a', producer: 'p', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const pred: InvariantPredicate = { any: [{ path: 'a', is: 'owed' }, { path: 'a', is: 'green' }] };
+  assert.equal(evalInvariantPredicate(pred, arts, notDoneStatus()), true); // a is green
+  const pred2: InvariantPredicate = { any: [{ path: 'a', is: 'owed' }, { path: 'a', is: 'rejected' }] };
+  assert.equal(evalInvariantPredicate(pred2, arts, notDoneStatus()), false); // neither
+});
+
+// §3.2 test 21: {not:...} negation
+test('evalInvariantPredicate: not:... negation', () => {
+  const arts = new Map<string, ArtifactData>();
+  arts.set('x', { workflow: '', path: 'x', producer: 'p', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  assert.equal(evalInvariantPredicate({ not: { path: 'x', is: 'green' } }, arts, notDoneStatus()), false);
+  assert.equal(evalInvariantPredicate({ not: { path: 'x', is: 'owed' } }, arts, notDoneStatus()), true);
+});
+
+// §3.2 test 22: absent path with is:'green' → false (no throw)
+test('evalInvariantPredicate: absent path with is:green → false, no throw', () => {
+  const arts = new Map<string, ArtifactData>();
+  // 'plan' is not in the map at all
+  assert.equal(evalInvariantPredicate({ path: 'plan', is: 'green' }, arts, notDoneStatus()), false);
+  assert.doesNotThrow(() => evalInvariantPredicate({ path: 'plan', is: 'green' }, arts, notDoneStatus()));
+});
+
+// ---- Part 5: modelCheck invariant integration tests (§3.3) --------------------
+
+// Helpers for invariant-bearing defs
+const deliveryInvDef: WorkflowDef = {
+  ...deliveryProvidedNoSchemaStall,
+  name: 'delivery-inv',
+  invariants: [
+    // This invariant holds everywhere: the proposal input is always present in
+    // the artifact map (seeded at instance creation and never removed).
+    {
+      name: 'proposal-always-present',
+      requires: { path: 'proposal', is: 'present' as const },
+    },
+  ] satisfies InvariantDef[],
+};
+
+// A def with a violated invariant: requires plan to be green from the start — but it starts owed
+const deliveryViolatedInvDef: WorkflowDef = {
+  ...deliveryProvidedNoSchemaStall,
+  name: 'delivery-violated',
+  invariants: [
+    {
+      name: 'plan-must-always-be-green',
+      requires: { path: 'plan', is: 'green' as const }, // violated immediately — plan starts owed
+    },
+  ] satisfies InvariantDef[],
+};
+
+// A 1-loop def where the worker can skip its output. Reaching `done` via skip
+// leaves `result` skipped (not green), violating "when done, result must be green".
+// The violation is at BFS depth >= 1 (you must fire worker/skip to reach it), so a
+// re-drive of its counterexample path actually executes — unlike a depth-0 violation.
+const skipDoneInvDef: WorkflowDef = {
+  ...def(
+    'skip-done',
+    [input('start', { seedOwed: false })],
+    [loop({ name: 'worker', consumes: ['start'], produces: ['result'], maxSchemaFailures: 0 })],
+  ),
+  invariants: [
+    {
+      name: 'result-green-when-done',
+      when: { state: 'done' as const },
+      requires: { path: 'result', is: 'green' as const },
+    },
+  ] satisfies InvariantDef[],
+};
+
+// §3.3 test 23: invariant that holds everywhere → invariantViolations empty
+test('modelCheck: invariant that holds everywhere → invariantViolations empty', () => {
+  const report = modelCheck(deliveryInvDef, { maxStates: 500 });
+  assert.deepEqual(report.invariantViolations, [], 'no invariant violations expected');
+});
+
+// §3.3 test 24: invariant violated → exactly one violation, .invariant name matches, .path is array
+test('modelCheck: violated invariant → exactly one violation with correct name and array path', () => {
+  const report = modelCheck(deliveryViolatedInvDef, { maxStates: 500 });
+  assert.equal(report.invariantViolations.length, 1, 'expected exactly one violation');
+  assert.equal(report.invariantViolations[0]!.invariant, 'plan-must-always-be-green');
+  assert.ok(Array.isArray(report.invariantViolations[0]!.path), 'path should be an array');
+});
+
+// §3.3 test 25: real-witness re-drive (trustworthiness)
+test('modelCheck: real-witness re-drive — counterexample path is genuinely executable', () => {
+  const report = modelCheck(skipDoneInvDef, { maxStates: 500 });
+  assert.equal(report.invariantViolations.length, 1, 'need exactly one violation to re-drive');
+  const violation = report.invariantViolations[0]!;
+  // The violation must be reached by firing at least one step (not a depth-0 seed
+  // violation) — otherwise the re-drive loop below would be vacuous.
+  assert.ok(violation.path.length >= 1, 'counterexample must require >= 1 firing (non-vacuous re-drive)');
+
+  // Seed the initial state the same way modelCheck does: `start` green (seedOwed=false).
+  let memMap = new Map<string, ArtifactData>();
+  memMap.set('start', {
+    workflow: '',
+    path: 'start',
+    producer: 'human',
+    acceptance: 'green',
+    version: 1,
+    reasons: [],
+    judgmentRejects: 0,
+    schemaRejects: 0,
+  });
+  memMap = settleInMemory(skipDoneInvDef, memMap);
+
+  // Walk each step in the counterexample path through the real in-memory transitions.
+  for (const step of violation.path) {
+    const firings = eligibleFirings(skipDoneInvDef, memMap);
+    const firing = firings.find((f) => f.loop === step.loop && f.key === step.key);
+    assert.ok(firing, `expected a firing for ${step.loop}/${step.key} at this step`);
+    const successors = applyOutcome(skipDoneInvDef, memMap, firing, step.outcome, { maxCollectionSize: 2 });
+    assert.ok(successors.length > 0, 'applyOutcome must return at least one successor');
+    memMap = successors[0]!;
+  }
+  // memMap is now the state at the end of the violation path. Prove it genuinely violates.
+  const finalStatus = workflowStatus(skipDoneInvDef, memMap);
+  const inv = skipDoneInvDef.invariants![0]!;
+  const ALWAYS_TRUE: InvariantPredicate = { all: [] };
+  const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, memMap, finalStatus);
+  const requiresHolds = evalInvariantPredicate(inv.requires, memMap, finalStatus);
+  assert.equal(whenHolds, true, 'when-guard (state:done) must be true in the reached state');
+  assert.equal(requiresHolds, false, 'requires (result green) must be FALSE — proving the counterexample is real');
+});
+
+// §3.3 test 26: a `when:{state:'done'}`-guarded invariant that HOLDS everywhere.
+// proposal is seeded and never removed, so "when done, proposal must be present"
+// holds in every reachable done state — exercising the when-guard in the holding
+// direction (test 27 exercises the same guard shape in the violated direction).
+test('modelCheck: when:state-done guarded invariant that holds → no violations', () => {
+  const deliveryDoneGuardedInvDef: WorkflowDef = {
+    ...deliveryProvidedNoSchemaStall,
+    name: 'delivery-done-guarded',
+    invariants: [
+      {
+        name: 'proposal-present-when-done',
+        when: { state: 'done' as const },
+        requires: { path: 'proposal', is: 'present' as const },
+      },
+    ] satisfies InvariantDef[],
+  };
+  const report = modelCheck(deliveryDoneGuardedInvDef, { maxStates: 500 });
+  assert.deepEqual(report.invariantViolations, [], 'when-guarded invariant should hold in all done states');
+});
+
+// §3.3 test 27: {state:'done'} invariant violated (1-loop def where done is reachable with output skipped)
+test('modelCheck: state:done invariant violated when done-state has wrong acceptance', () => {
+  // Reuses the module-level skipDoneInvDef: a 1-loop def where the worker can skip its output.
+  // When done via skip, the output is skipped not green → violates "when done, result is green".
+  const report = modelCheck(skipDoneInvDef, { maxStates: 500 });
+  // The workflow can reach done via skip (result=skipped), violating the invariant
+  assert.ok(report.invariantViolations.length >= 1, 'expected at least one violation when done via skip');
+  assert.equal(report.invariantViolations[0]!.invariant, 'result-green-when-done');
+});
+
+// §3.3 test 28: bounded-still-reports — depth-0 violation with tiny bounds → bounded=true AND violations>=1
+test('modelCheck: bounded-still-reports — depth-0 violation with tiny bounds', () => {
+  const report = modelCheck(deliveryViolatedInvDef, { maxStates: 3, maxDepth: 1 });
+  assert.equal(report.bounded, true, 'should be bounded with tiny limits');
+  assert.ok(report.invariantViolations.length >= 1, 'should still report invariant violations under bounds');
+});
+
+// ---- Part 6: CLI invariant tests (§3.4) ----------------------------------------
+
+function makeInvCli(yaml: string, defName: string) {
+  const defsDir = mkdtempSync(join(tmpdir(), 'oweflow-inv-'));
+  writeFileSync(join(defsDir, `${defName}.yaml`), yaml);
+  const home = mkdtempSync(join(tmpdir(), 'oweflow-inv-home-'));
+  const db = join(home, 'state.db');
+  const env: Record<string, string | undefined> = { OWEFLOW_DEFS: defsDir, OWEFLOW_DB: db };
+  const run = (...argv: string[]) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = main(argv, { cwd: home, env, out: (s) => out.push(s), err: (s) => err.push(s) });
+    return { code, out: out.join('\n'), err: err.join('\n') };
+  };
+  return { run };
+}
+
+const violatedInvYaml = [
+  'name: inv-violated',
+  'inputs:',
+  '  - name: start',
+  '    seedOwed: false',
+  'loops:',
+  '  - name: worker',
+  '    consumes: [start]',
+  '    produces: [result]',
+  '    maxSchemaFailures: 0',
+  '    body: run',
+  'invariants:',
+  '  - name: result-must-always-be-green',
+  '    requires:',
+  '      path: result',
+  '      is: green',
+].join('\n');
+
+// §3.4 test 29: YAML def with violated invariant → code=1, /DEFECTS FOUND/, /Invariant violations/, name
+test('CLI check: violated invariant → exit 1, DEFECTS FOUND, Invariant violations, invariant name in output', () => {
+  const { run } = makeInvCli(violatedInvYaml, 'inv-violated');
+  const r = run('check', 'inv-violated');
+  assert.equal(r.code, 1, 'violated invariant → exit 1');
+  assert.match(r.out, /DEFECTS FOUND/);
+  assert.match(r.out, /Invariant violations/);
+  assert.match(r.out, /result-must-always-be-green/);
+});
+
+// §3.4 test 30: tight --max-states 2 → exit 1 (violation under bounds), /SEARCH INCOMPLETE/ banner present
+test('CLI check: violated invariant under tight bounds → exit 1 and SEARCH INCOMPLETE banner', () => {
+  const { run } = makeInvCli(violatedInvYaml, 'inv-violated');
+  const r = run('check', 'inv-violated', '--max-states', '2');
+  assert.equal(r.code, 1, 'invariant violation under bounds → exit 1 (soundness asymmetry)');
+  assert.match(r.out, /SEARCH INCOMPLETE/);
+  assert.match(r.out, /Invariant violations/);
+});
+
+// §3.4 test 31: --format json → parsed report has invariantViolations array with the violation
+test('CLI check: --format json → report has invariantViolations array with violation', () => {
+  const { run } = makeInvCli(violatedInvYaml, 'inv-violated');
+  const r = run('check', 'inv-violated', '--format', 'json');
+  assert.equal(r.code, 1, 'violated invariant → exit 1 even in json format');
+  const report = JSON.parse(r.out);
+  assert.ok('invariantViolations' in report, 'report must have invariantViolations field');
+  assert.ok(Array.isArray(report.invariantViolations), 'invariantViolations must be an array');
+  assert.ok(report.invariantViolations.length >= 1, 'should have at least one violation');
+  assert.equal(report.invariantViolations[0].invariant, 'result-must-always-be-green');
+});
+
+// §3.4 test 32: def whose invariants all hold → exit 0, no 'Invariant violations' in output
+test('CLI check: all invariants hold → exit 0, no Invariant violations in output', () => {
+  // The input `start` is always present in the artifact map (seeded at creation).
+  // This invariant holds in every reachable state.
+  const yaml = [
+    'name: inv-holds',
+    'inputs:',
+    '  - name: start',
+    '    seedOwed: false',
+    'loops:',
+    '  - name: worker',
+    '    consumes: [start]',
+    '    produces: [result]',
+    '    maxSchemaFailures: 0',
+    '    body: run',
+    'invariants:',
+    '  - name: start-always-present',
+    '    requires:',
+    '      path: start',
+    '      is: present',
+  ].join('\n');
+  const { run } = makeInvCli(yaml, 'inv-holds');
+  const r = run('check', 'inv-holds');
+  assert.equal(r.code, 0, 'holding invariant → exit 0');
+  assert.doesNotMatch(r.out, /Invariant violations/);
+});
+
+// §3.4 test 33: invariant referencing unknown stem → exit 1, err /unknown stem 'nonexistent'/
+test('CLI check: invariant with unknown stem → exit 1, err contains /unknown stem/', () => {
+  const yaml = [
+    'name: inv-bad-stem',
+    'inputs:',
+    '  - name: start',
+    '    seedOwed: false',
+    'loops:',
+    '  - name: worker',
+    '    consumes: [start]',
+    '    produces: [result]',
+    '    body: run',
+    'invariants:',
+    '  - name: bad-stem',
+    '    requires:',
+    '      path: nonexistent',
+    '      is: green',
+  ].join('\n');
+  const { run } = makeInvCli(yaml, 'inv-bad-stem');
+  const r = run('check', 'inv-bad-stem');
+  assert.equal(r.code, 1, 'unknown stem in invariant → exit 1');
+  assert.match(r.err, /unknown stem 'nonexistent'/);
 });

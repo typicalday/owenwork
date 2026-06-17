@@ -34,7 +34,7 @@ import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { DefError, lintDef, loadDefs, loadDefsRaw } from './defs.ts';
+import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 
 export interface CliIO {
@@ -184,7 +184,7 @@ Commands:
   defs                                   list available workflow definitions
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N]
-                                         bounded reachability check (deadlocks, stuck, dead loops)
+                                         bounded reachability check (deadlocks, stuck, dead loops, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   tick <wf> [--now <ms>]                 pull eligible orders
@@ -250,6 +250,13 @@ function dispatch(command: string, io: CliIO, args: Args): void {
       );
     }
 
+    // loadDefsRaw uses buildDef (no semantic validation); run validateDef here so
+    // invariant stem-reference / duplicate-name errors surface to the author.
+    const defErrors = validateDef(def);
+    if (defErrors.length > 0) {
+      throw new CliError(`workflow '${def.name}' has validation errors:\n  - ${defErrors.join('\n  - ')}`);
+    }
+
     const format = last(args, 'format') ?? 'text';
     const maxDepth = last(args, 'max-depth') !== undefined ? Number(last(args, 'max-depth')) : undefined;
     const maxStates = last(args, 'max-states') !== undefined ? Number(last(args, 'max-states')) : undefined;
@@ -265,7 +272,8 @@ function dispatch(command: string, io: CliIO, args: Args): void {
       print(io, report);
     } else {
       // text format
-      const clean = report.deadlocks.length === 0 && report.stuck.length === 0;
+      const clean = report.deadlocks.length === 0 && report.stuck.length === 0
+        && report.invariantViolations.length === 0;
       const status = clean && report.completable ? 'OK' : clean ? 'INCOMPLETE' : 'DEFECTS FOUND';
       io.out(`=== oweflow check: ${def.name} ===`);
       io.out(`Status: ${status}`);
@@ -290,6 +298,14 @@ function dispatch(command: string, io: CliIO, args: Args): void {
           io.out(`  path: ${s.path.map((p) => `${p.loop}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
+      if (report.invariantViolations.length > 0) {
+        io.out('');
+        io.out(`Invariant violations (${report.invariantViolations.length}):`);
+        for (const v of report.invariantViolations) {
+          io.out(`  invariant: ${v.invariant}`);
+          io.out(`  path: ${v.path.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+        }
+      }
       if (report.deadLoops.length > 0) {
         io.out('');
         io.out(`Dead loops (never fire in explored space): ${report.deadLoops.join(', ')}`);
@@ -302,12 +318,23 @@ function dispatch(command: string, io: CliIO, args: Args): void {
     }
 
     // Exit codes:
-    // - definite defect (deadlock or stuck and search was EXHAUSTIVE, i.e. !bounded) → nonzero
-    // - truncated (bounded=true) regardless of findings → 0 (truncation is not a defect)
-    // - clean exhaustive search → 0
-    const hasDefiniteDefect = !report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0);
+    // - invariant violations → ALWAYS nonzero, regardless of bounded. A reported
+    //   counterexample path was produced by real applyOutcome/settleInMemory
+    //   transitions (pinned to the live Engine by the conformance test). The path
+    //   is a genuine executable witness; bounds only cause MISSES, never
+    //   fabrications. Contrast deadlocks/stuck, where the maxCollectionSize cap can
+    //   manufacture a spurious "no moves" state — hence those require !bounded.
+    //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
+    // - definite deadlock/stuck only when EXHAUSTIVE (!bounded) → nonzero
+    // - truncated with no invariant violations → 0
+    const hasDefiniteDefect =
+      report.invariantViolations.length > 0 ||
+      (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
     if (hasDefiniteDefect) {
-      throw new CliError(`definite defects found (${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`);
+      throw new CliError(
+        `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+        `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+      );
     }
     return;
   }
