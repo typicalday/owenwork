@@ -241,3 +241,80 @@ test('listRuns returns all runs for a workflow ordered by created_at, rowid', ()
 
   s.close();
 });
+
+// ---- alarm_at round-trip (PR3b: idle trigger) --------------------------------
+
+test('setAlarm / getAlarm / clearAlarm round-trip', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const loop = 'completion';
+  const alarmTime = 9999;
+
+  // No alarm yet — getAlarm returns undefined
+  assert.equal(s.getAlarm(wf, loop), undefined);
+
+  // setAlarm creates the task row and sets alarm_at
+  s.setAlarm(wf, loop, alarmTime);
+  assert.equal(s.getAlarm(wf, loop), alarmTime, 'getAlarm returns the stored alarm_at');
+
+  // clearAlarm sets alarm_at to null → getAlarm returns undefined
+  s.clearAlarm(wf, loop);
+  assert.equal(s.getAlarm(wf, loop), undefined, 'getAlarm returns undefined after clearAlarm');
+
+  s.close();
+});
+
+test('setAlarm updates an existing task row (upsert path)', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const loop = 'completion';
+
+  // Create the task row via putTask first
+  s.putTask({ workflow: wf, loop, key: '', status: 'idle', attempts: 0 });
+
+  // setAlarm on existing row
+  s.setAlarm(wf, loop, 12345);
+  assert.equal(s.getAlarm(wf, loop), 12345);
+
+  // Update alarm
+  s.setAlarm(wf, loop, 99999);
+  assert.equal(s.getAlarm(wf, loop), 99999, 'setAlarm updates alarm_at on existing row');
+
+  s.close();
+});
+
+test('lastProgressMs returns 0 when no artifacts exist', () => {
+  const s = mem();
+  const wf = randId('wf');
+  assert.equal(s.lastProgressMs(wf), 0);
+  s.close();
+});
+
+test('lastProgressMs returns MAX(updated_at) of artifacts for the workflow', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const wf2 = randId('wf');
+
+  const base: ArtifactData = {
+    workflow: wf,
+    path: 'plan',
+    producer: 'planner',
+    acceptance: 'owed',
+    version: 0,
+    reasons: [],
+    judgmentRejects: 0,
+    schemaRejects: 0,
+  };
+
+  // Insert an artifact; lastProgressMs should return its updated_at
+  s.putArtifact(base);
+  const t1 = s.lastProgressMs(wf);
+  assert.ok(t1 > 0, 'lastProgressMs > 0 after first artifact');
+
+  // Insert another artifact for a different workflow — must not affect wf
+  s.putArtifact({ ...base, workflow: wf2, path: 'plan' });
+  const t2 = s.lastProgressMs(wf);
+  assert.equal(t2, t1, 'lastProgressMs is scoped to the workflow');
+
+  s.close();
+});
