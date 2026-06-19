@@ -1324,7 +1324,11 @@ function applyOpInMemory(
       reasons: [
         ...art.reasons,
         {
-          at: Date.now(),
+          // E-PURITY: the pure in-memory twin (applyOpInMemory / settleInMemory) must not
+          // read wall-clock time.  reason.at is non-semantic in the model layer — the
+          // conformance test compares cascade state (acceptance/version/fingerprint), not
+          // reasons — so a deterministic sentinel (0) keeps model.ts clock-free.
+          at: 0,
           action: 'pinned',
           kind: 'structural',
           by: 'engine',
@@ -1344,7 +1348,9 @@ function applyOpInMemory(
     newArt.reasons = [
       ...art.reasons,
       {
-        at: Date.now(),
+        // E-PURITY sentinel — same reasoning as the pin case above: reason.at is
+        // non-semantic in the model layer; 0 keeps model.ts clock-free.
+        at: 0,
         action: 'reject',
         kind: 'invalidated-irreversible',
         by: 'engine',
