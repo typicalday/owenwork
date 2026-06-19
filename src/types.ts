@@ -201,6 +201,10 @@ export interface LoopDef {
   /** Parsed idleAfter in milliseconds. */
   idleAfterMs?: number;
   body: string; // prompt body
+  /** Mode 2 foundation: name of the child workflow this loop delegates to. Machine-handled, never a worker firing. */
+  calls?: string;
+  /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: loop. */
+  callsInputs?: Record<string, string>;
 }
 
 /** A workflow definition: a set of loops plus declared external inputs. */

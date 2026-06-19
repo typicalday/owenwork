@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
@@ -1177,4 +1178,288 @@ test('D-D: buildDef with valid named-handler passes (no throw)', () => {
       ],
     });
   }, 'buildDef must not throw for a valid named-handler string');
+});
+
+// ---- M2-GRAMMAR: calls: parsing + validation + cycle tests -------------------
+
+test('parseDef: calls: loop sets calls and callsInputs fields', () => {
+  const d = parseDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    loops: [
+      { name: 'deliver', calls: 'delivery', inputs: { proposal: 'proposal' }, produces: ['delivered'] },
+      { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
+    ],
+  });
+  const deliverLoop = d.loops.find((l) => l.name === 'deliver');
+  assert.ok(deliverLoop !== undefined, 'deliver loop must exist');
+  assert.equal(deliverLoop.calls, 'delivery');
+  assert.deepEqual(deliverLoop.callsInputs, { proposal: 'proposal' });
+  assert.equal(deliverLoop.body, '', 'calls: loop must have empty body');
+  assert.equal(deliverLoop.produces.length, 1, 'calls: loop must produce exactly one artifact');
+  assert.equal(deliverLoop.produces[0]!.stem, 'delivered');
+  assert.deepEqual(deliverLoop.consumes, [], 'calls: loop must have no consumes');
+});
+
+test('validateDef: calls: loop must produce exactly one output — zero outputs errors', () => {
+  const d = buildDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    loops: [
+      // calls: loop with zero produces — should be caught by validateDef
+      // We bypass buildLoop by using a hack: we build a def with a calls: loop then remove produces
+      { name: 'deliver', calls: 'delivery', inputs: {}, produces: ['delivered'] },
+      { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
+    ],
+  });
+  // Manually zero out the produces to trigger the error
+  const deliverLoop = d.loops.find((l) => l.name === 'deliver')!;
+  deliverLoop.produces = [];
+  const errors = validateDef(d);
+  assert.ok(errors.some((e) => e.includes('exactly one output')), `Expected 'exactly one output' error; got: ${errors.join('; ')}`);
+});
+
+test('validateDef: calls: loop must produce exactly one output — two outputs errors', () => {
+  const d = buildDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    loops: [
+      { name: 'deliver', calls: 'delivery', inputs: {}, produces: ['delivered'] },
+      { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
+    ],
+  });
+  const deliverLoop = d.loops.find((l) => l.name === 'deliver')!;
+  // Inject a second produce manually
+  deliverLoop.produces = [deliverLoop.produces[0]!, parseProduce('extra')];
+  const errors = validateDef(d);
+  assert.ok(errors.some((e) => e.includes('exactly one output')), `Expected 'exactly one output' error; got: ${errors.join('; ')}`);
+});
+
+test('validateDef: calls: loop callsInputs value must be a real parent artifact', () => {
+  const d = buildDef({
+    name: 'parent',
+    inputs: [{ name: 'proposal' }],
+    loops: [
+      { name: 'deliver', calls: 'delivery', inputs: { proposal: 'nonexistent_artifact' }, produces: ['delivered'] },
+      { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
+    ],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes("parent artifact 'nonexistent_artifact'")),
+    `Expected parent artifact error; got: ${errors.join('; ')}`,
+  );
+});
+
+test('loadDefs: calls target must exist in resolver namespace', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      [
+        'name: parent',
+        'inputs:',
+        '  - name: proposal',
+        '    seedOwed: true',
+        'loops:',
+        '  - name: deliver',
+        '    calls: does-not-exist',
+        '    produces: [delivered]',
+        '  - name: teardown',
+        '    consumes: [delivered]',
+        '    produces: [done]',
+        '    terminal: true',
+      ].join('\n'),
+    );
+    assert.throws(
+      () => loadDefs(dir),
+      (err: unknown) => {
+        assert.ok(err instanceof DefError, `expected DefError, got ${err}`);
+        assert.ok(
+          /does-not-exist.*does not exist/.test(err.message),
+          `expected missing-target error; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadDefs: calls: inputs key must be a declared child input', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    // Write child def with no inputs
+    writeFileSync(
+      join(dir, 'child.yaml'),
+      [
+        'name: child',
+        'loops:',
+        '  - name: worker',
+        '    produces: [result]',
+        '    body: do work',
+      ].join('\n'),
+    );
+    // Write parent that maps 'proposal' -> child input that does not exist
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      [
+        'name: parent',
+        'inputs:',
+        '  - name: proposal',
+        '    seedOwed: true',
+        'loops:',
+        '  - name: deliver',
+        '    calls: child',
+        '    inputs:',
+        '      proposal: proposal',
+        '    produces: [delivered]',
+        '  - name: teardown',
+        '    consumes: [delivered]',
+        '    produces: [done]',
+        '    terminal: true',
+      ].join('\n'),
+    );
+    assert.throws(
+      () => loadDefs(dir),
+      (err: unknown) => {
+        assert.ok(err instanceof DefError, `expected DefError, got ${err}`);
+        assert.ok(
+          /maps input 'proposal'.*does not declare/.test(err.message),
+          `expected child-input error; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    writeFileSync(
+      join(dir, 'a.yaml'),
+      [
+        'name: a',
+        'loops:',
+        '  - name: delegate',
+        '    calls: b',
+        '    produces: [result]',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'b.yaml'),
+      [
+        'name: b',
+        'loops:',
+        '  - name: delegate',
+        '    calls: a',
+        '    produces: [result]',
+      ].join('\n'),
+    );
+    assert.throws(
+      () => loadDefs(dir),
+      (err: unknown) => {
+        assert.ok(err instanceof DefError, `expected DefError, got ${err}`);
+        assert.ok(
+          /calls cycle:/.test(err.message),
+          `expected calls-cycle error; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    writeFileSync(
+      join(dir, 'b.yaml'),
+      [
+        'name: b',
+        'loops:',
+        '  - name: worker',
+        '    produces: [result]',
+        '    body: do work',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'a.yaml'),
+      [
+        'name: a',
+        'loops:',
+        '  - name: delegate',
+        '    calls: b',
+        '    produces: [delegated]',
+        '  - name: sink',
+        '    consumes: [delegated]',
+        '    produces: [done]',
+        '    terminal: true',
+        '    body: done',
+      ].join('\n'),
+    );
+    assert.doesNotThrow(() => loadDefs(dir), 'acyclic A -> B calls chain must not throw');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('include cycle and calls cycle are detected independently', () => {
+  // Calls cycle: a calls b calls a
+  const callsDir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    writeFileSync(
+      join(callsDir, 'a.yaml'),
+      ['name: a', 'loops:', '  - name: d', '    calls: b', '    produces: [r]'].join('\n'),
+    );
+    writeFileSync(
+      join(callsDir, 'b.yaml'),
+      ['name: b', 'loops:', '  - name: d', '    calls: a', '    produces: [r]'].join('\n'),
+    );
+    let callsCycleErr: Error | undefined;
+    try { loadDefs(callsDir); } catch (e) { callsCycleErr = e as Error; }
+    assert.ok(callsCycleErr instanceof DefError, 'calls cycle must throw DefError');
+    assert.ok(/calls cycle:/.test(callsCycleErr.message), `calls cycle error must mention 'calls cycle:'; got: ${callsCycleErr.message}`);
+    assert.ok(!/include cycle:/.test(callsCycleErr.message), 'calls cycle error must NOT say include cycle');
+  } finally {
+    rmSync(callsDir, { recursive: true, force: true });
+  }
+
+  // Include cycle: a includes b includes a — must produce a different error
+  const includeDir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  try {
+    writeFileSync(
+      join(includeDir, 'a.yaml'),
+      ['name: a', 'loops:', '  - include: b', '    as: bpart'].join('\n'),
+    );
+    writeFileSync(
+      join(includeDir, 'b.yaml'),
+      ['name: b', 'loops:', '  - include: a', '    as: apart'].join('\n'),
+    );
+    let includeCycleErr: Error | undefined;
+    try { loadDefs(includeDir); } catch (e) { includeCycleErr = e as Error; }
+    assert.ok(includeCycleErr instanceof DefError, 'include cycle must throw DefError');
+    assert.ok(/include cycle:/.test(includeCycleErr.message), `include cycle error must mention 'include cycle:'; got: ${includeCycleErr.message}`);
+    assert.ok(!/calls cycle:/.test(includeCycleErr.message), 'include cycle error must NOT say calls cycle');
+  } finally {
+    rmSync(includeDir, { recursive: true, force: true });
+  }
+});
+
+test('loadDefs end-to-end on examples/workflows yields provisioned-delivery and delivery side by side', () => {
+  const examplesDir = join(new URL('..', import.meta.url).pathname, 'examples', 'workflows');
+  const defs = loadDefs(examplesDir);
+  assert.ok(defs.has('delivery'), 'delivery must be in the loaded defs');
+  assert.ok(defs.has('provisioned-delivery'), 'provisioned-delivery must be in the loaded defs');
+  const pd = defs.get('provisioned-delivery')!;
+  const deliverLoop = pd.loops.find((l) => l.name === 'deliver');
+  assert.ok(deliverLoop !== undefined, 'provisioned-delivery must have a deliver loop');
+  assert.equal(deliverLoop.calls, 'delivery', 'deliver loop must call delivery');
+  assert.deepEqual(deliverLoop.callsInputs, { proposal: 'proposal' });
 });

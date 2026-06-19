@@ -126,6 +126,8 @@ export interface CreateOpts {
   params?: Record<string, string>;
   /** values for inputs provided at start (keyed by input name) */
   provide?: Record<string, Record<string, unknown>>;
+  /** Mode 2 foundation: parent-coordinate link for a child instance spawned by a calls: loop. Persisted to store; no other behavior in PR5a. */
+  producedBy?: { parentWf: string; parentPath: string };
 }
 
 export type DefResolver = (defName: string) => WorkflowDef;
@@ -208,7 +210,7 @@ export class Engine {
       const wfData: { def: string; title?: string; params?: Record<string, string> } = { def: defName };
       if (opts.title !== undefined) wfData.title = opts.title;
       if (opts.params !== undefined) wfData.params = opts.params;
-      this.store.insertWorkflow(id, wfData);
+      this.store.insertWorkflow(id, wfData, opts.producedBy);
 
       for (const input of def.inputs) {
         const provided = opts.provide?.[input.name];

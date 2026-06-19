@@ -45,6 +45,8 @@ export interface RunRow extends RunData {
 export interface WorkflowRow extends WorkflowData {
   id: string;
   createdAt: number;
+  /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: loop. */
+  producedBy?: { parentWf: string; parentPath: string };
 }
 
 // ---- deterministic ids -------------------------------------------------------
@@ -127,7 +129,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-const SCHEMA_VERSION = '2';
+const SCHEMA_VERSION = '3';
 
 // ---- (de)serialization helpers ----------------------------------------------
 
@@ -244,6 +246,8 @@ interface WorkflowRowRaw {
   def: string;
   title: string | null;
   params: string;
+  produced_by_wf: string | null;
+  produced_by_path: string | null;
   created_at: number;
 }
 
@@ -255,6 +259,9 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
     createdAt: r.created_at,
   };
   if (r.title !== null) out.title = r.title;
+  if (r.produced_by_wf !== null && r.produced_by_path !== null) {
+    out.producedBy = { parentWf: r.produced_by_wf, parentPath: r.produced_by_path };
+  }
   return out;
 }
 
@@ -298,6 +305,16 @@ export class Store {
     if (!taskCols.some((c) => c.name === 'alarm_at')) {
       this.db.exec(`ALTER TABLE task ADD COLUMN alarm_at INTEGER`);
     }
+    // M2-LINK (§4.2, R11): nullable parent-coordinate columns for calls: child instances.
+    const wfCols = this.db.prepare(`PRAGMA table_info(workflow)`).all() as Array<{ name: string }>;
+    if (!wfCols.some((c) => c.name === 'produced_by_wf')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN produced_by_wf TEXT`);
+    }
+    if (!wfCols.some((c) => c.name === 'produced_by_path')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN produced_by_path TEXT`);
+    }
+    // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
+    this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
   }
 
   /**
@@ -325,11 +342,19 @@ export class Store {
 
   // -- workflow ----------------------------------------------------------------
 
-  insertWorkflow(id: string, data: WorkflowData): WorkflowRow {
+  insertWorkflow(id: string, data: WorkflowData, producedBy?: { parentWf: string; parentPath: string }): WorkflowRow {
     const at = nowMs();
     this.db
-      .prepare('INSERT INTO workflow (id, def, title, params, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(id, data.def, data.title ?? null, JSON.stringify(data.params ?? {}), at);
+      .prepare('INSERT INTO workflow (id, def, title, params, produced_by_wf, produced_by_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        id,
+        data.def,
+        data.title ?? null,
+        JSON.stringify(data.params ?? {}),
+        producedBy?.parentWf ?? null,
+        producedBy?.parentPath ?? null,
+        at,
+      );
     return this.getWorkflow(id) as WorkflowRow;
   }
 
@@ -352,6 +377,27 @@ export class Store {
     this.db.prepare('DELETE FROM task WHERE workflow = ?').run(id);
     this.db.prepare('DELETE FROM run WHERE workflow = ?').run(id);
     this.db.prepare('DELETE FROM workflow WHERE id = ?').run(id);
+  }
+
+  /**
+   * M2-LINK reverse-lookup: find the child workflow instance spawned by a calls: loop.
+   * Used by PR5b re-attach guard (never-duplicate). Returns undefined when no match.
+   */
+  findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
+    const r = this.db
+      .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ?')
+      .get(parentWf, parentPath) as WorkflowRowRaw | undefined;
+    return r ? mapWorkflow(r) : undefined;
+  }
+
+  /**
+   * M2-LINK reverse-lookup: list all child workflow instances produced by a given parent workflow.
+   */
+  listChildrenByParent(parentWf: string): WorkflowRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? ORDER BY created_at')
+      .all(parentWf) as WorkflowRowRaw[];
+    return rows.map(mapWorkflow);
   }
 
   // -- artifact ----------------------------------------------------------------

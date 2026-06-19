@@ -883,3 +883,37 @@ test('idle trigger fires the evaluator loop when alarm is set and threshold is r
   assert.ok(tAt.dueAt !== undefined, 'dueAt field must be present when idle loops exist');
   assert.equal(typeof tAt.dueAt, 'number', 'dueAt must be a number');
 });
+
+// ---- M2-CREATE: createInstance with producedBy persists parent coordinates ----
+
+test('createInstance with producedBy persists parent coordinates and is readable', () => {
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name) => {
+    if (name === 'delivery') return delivery;
+    throw new Error(`unknown def: ${name}`);
+  });
+
+  const parentWf = 'wf_parent_test';
+  const parentPath = 'deliver';
+
+  const childId = engine.createInstance('delivery', {
+    producedBy: { parentWf, parentPath },
+  });
+
+  // Verify via getWorkflow
+  const row = store.getWorkflow(childId);
+  assert.ok(row !== undefined, 'child workflow row must exist');
+  assert.deepEqual(
+    row.producedBy,
+    { parentWf, parentPath },
+    'producedBy must round-trip through insertWorkflow',
+  );
+
+  // Verify via findChildByParent
+  const found = store.findChildByParent(parentWf, parentPath);
+  assert.ok(found !== undefined, 'findChildByParent must return the child');
+  assert.equal(found.id, childId, 'findChildByParent must return the correct child');
+  assert.deepEqual(found.producedBy, { parentWf, parentPath });
+
+  store.close();
+});

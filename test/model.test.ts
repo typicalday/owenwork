@@ -450,3 +450,91 @@ test('generates: buildGraph includes planner loop node and does not throw', () =
   // since nothing consumes it, there is no edge from planner for audit_log — just no crash.
   assert.ok(!graph.edges.some((e) => e.stem === 'audit_log'), 'no edge for unconsumed audit_log');
 });
+
+// ---- M2-FIRINGS: eligibleFirings, pendingOwed, and debt/done for calls: loops --
+
+import { parseProduce } from '../src/paths.ts';
+
+/** Build a minimal calls: LoopDef directly (helpers.ts loop() does not support calls:). */
+function callsLoop(name: string, callsTarget: string, produceStem: string): import('../src/types.ts').LoopDef {
+  return {
+    name,
+    calls: callsTarget,
+    callsInputs: {},
+    consumes: [],
+    produces: [parseProduce(produceStem)],
+    invalidates: [],
+    cadence: '0s',
+    cadenceSecs: 0,
+    maxRunsPerDay: 1000,
+    parallel: 1,
+    maxAttempts: 1,
+    maxSchemaFailures: 5,
+    workdir: 'main',
+    body: '',
+  };
+}
+
+test('eligibleFirings skips calls: loops — no firing is emitted for the calls: loop', () => {
+  // Def with one calls: loop (deliver) and one normal loop (teardown)
+  const d = def(
+    'parent',
+    [input('proposal')],
+    [
+      callsLoop('deliver', 'delivery', 'delivered'),
+      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+    ],
+  );
+  // Seed: proposal green, delivered owed (so teardown cannot fire either — missing 'delivered')
+  const artMap = arts([
+    { path: 'proposal', acceptance: 'green', version: 1 },
+    { path: 'delivered', acceptance: 'owed', version: 0 },
+  ]);
+  const firings = eligibleFirings(d, artMap);
+  // The calls: loop must NOT appear in firings
+  assert.ok(
+    !firings.some((f) => f.loop === 'deliver'),
+    `calls: loop 'deliver' must not appear in eligibleFirings; got: ${firings.map((f) => f.loop).join(', ')}`,
+  );
+});
+
+test('pendingOwed seeds calls: loop output as owed', () => {
+  const d = def(
+    'parent',
+    [input('proposal')],
+    [
+      callsLoop('deliver', 'delivery', 'delivered'),
+      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+    ],
+  );
+  // Only proposal is seeded; 'delivered' and 'done' are not yet in arts
+  const artMap = arts([
+    { path: 'proposal', acceptance: 'green', version: 1 },
+  ]);
+  const owed = pendingOwed(d, artMap);
+  const owedPaths = owed.map((a) => a.path);
+  assert.ok(
+    owedPaths.includes('delivered'),
+    `calls: output 'delivered' must be seeded owed by pendingOwed; got: ${owedPaths.join(', ')}`,
+  );
+});
+
+test('workflow is not done while calls: output is owed', () => {
+  const d = def(
+    'parent',
+    [input('proposal')],
+    [
+      callsLoop('deliver', 'delivery', 'delivered'),
+      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+    ],
+  );
+  // All inputs green; calls: output owed; teardown output owed
+  const artMap = arts([
+    { path: 'proposal', acceptance: 'green', version: 1 },
+    { path: 'delivered', acceptance: 'owed', version: 0 },
+    { path: 'done', acceptance: 'owed', version: 0 },
+  ]);
+  const status = workflowStatus(d, artMap);
+  assert.equal(status.done, false, 'workflow must not be done while calls: output is owed');
+  assert.ok(status.debts.length > 0, 'workflow must have debts while calls: output is owed');
+});

@@ -400,3 +400,75 @@ Every child artifact and loop name is prefixed with `${as}.`:
 
 Mode 1's name-prefixing (`deliver.plan`, `deliver.merge`) affects `dev` tooling that keys on loop names (worktree wiring, dashboard rendering, fleet shape-matching). Making those prefix-aware is deferred to the dev-tooling PR. Mode 1 v1 is the right tool for **brand-new combined workflows** authored fresh; not for re-skinning an existing delivery line (use Mode 2 for that).
 
+
+---
+
+## §23 Mode 2 runtime workflow composition (`calls:`)
+
+Mode 2 is the **runtime** sibling of Mode 1 (`include:`). Instead of inlining a child workflow's loops at compile time, a `calls:` loop declares that a **separate child workflow instance** produces one of the parent's artifacts at runtime. The `calls:` loop is machine-handled — it never emits a worker order.
+
+> **PR5a** delivers the static foundation: grammar, validation, the cross-def cycle check, the `producedBy` parent-coordinate link, and `eligibleFirings` exclusion. **PR5b** will add the runtime cascade-up behavior (spawn-on-eligible, cross-boundary outcome read, machine-green, re-attach, re-provide).
+
+### §23.1 Grammar
+
+```yaml
+name: provisioned-delivery
+
+inputs:
+  - name: proposal
+    seedOwed: true
+
+loops:
+  - name: deliver
+    calls: delivery          # child workflow name (must exist in the same def directory)
+    inputs:                  # optional: child input name → parent artifact name
+      proposal: proposal
+    produces: [delivered]    # exactly one parent artifact (the outcome artifact)
+
+  - name: teardown
+    consumes: [delivered]
+    produces: [torn_down]
+    terminal: true
+    body: |
+      Tear down and green `torn_down`.
+```
+
+Shape rules:
+- `calls:` must name a workflow that exists in the same def directory (resolver namespace).
+- `inputs:` keys must be declared inputs of the child workflow; values must be parent artifact names (inputs or loop produces).
+- `produces:` must declare exactly one artifact (the parent artifact the child outcome feeds).
+- A `calls:` loop must NOT have a `body:` (it is machine-handled).
+
+### §23.2 `producedBy` parent-coordinate link
+
+When PR5b spawns a child instance, it passes `producedBy: { parentWf, parentPath }` to `createInstance`, which persists it via the store. The coordinate serves three duties:
+
+1. **Re-attach on reap**: when a child run is reaped, the engine re-attaches via the stored link.
+2. **Reverse lookup**: `store.findChildByParent(parentWf, parentPath)` — the never-duplicate guard in PR5b.
+3. **Cascade-up anchor**: the engine reads `producedBy` to propagate the child's outcome to the parent.
+
+**Storage**: two nullable columns on the `workflow` table — `produced_by_wf TEXT` and `produced_by_path TEXT` (both null for a top-level instance). Two columns (not a JSON blob) because the reverse lookup `(parentWf, parentPath) → child` must be SQL-indexable. The index `workflow_produced_by ON workflow(produced_by_wf, produced_by_path)` makes the lookup O(1). Added by the additive migration in `store.migrate()` (schema version 3).
+
+### §23.3 calls: loops are machine-handled
+
+- **Excluded from `eligibleFirings`**: `model.ts` skips any loop with `loop.calls` set. No worker order is ever emitted for a `calls:` loop.
+- **Owed artifact seeded normally**: `pendingOwed` seeds the calls: loop's one declared `produces` stem as owed at instance start (same code path as normal singleton produces).
+- **Debt/done correctness**: an owed calls: artifact is a normal debt. The parent workflow is not done until the calls: output is green (same logic as any other owed artifact — no special casing needed).
+
+### §23.4 Cross-def calls-cycle check
+
+At `loadDefs` time, after all defs are expanded and per-def validated, `detectCallsCycles(defs)` performs a DFS over the `calls:` edge graph and throws `DefError: calls cycle: a -> b -> a` if a cycle exists.
+
+This check is **separate** from the include-cycle guard in `expandIncludes` (§22.5) — they walk different edge kinds (`calls:` vs `include:`). An include cycle and a calls cycle can coexist independently and are reported with different messages (`calls cycle:` vs `include cycle:`).
+
+### §23.5 `createInstance.producedBy`
+
+`CreateOpts` gains `producedBy?: { parentWf: string; parentPath: string }`. When present, `createInstance` passes it to `insertWorkflow`, which stores both columns. No other behavior changes in PR5a — the field is wired end-to-end (store → engine → opts) so PR5b can call `createInstance({ producedBy })` without touching those layers.
+
+### §23.6 PR5b will add
+
+- **Spawn-on-eligible**: when a `calls:` loop's parent inputs are ready, the engine creates the child instance (via `createInstance` with `producedBy`).
+- **Cross-boundary outcome read**: after each child tick, the engine checks the child's declared `outcome` artifact; if green, it greens the parent's calls: artifact (cascade-up).
+- **Machine-green**: the cascade-up is engine-internal (never an event bus) and durable via the persisted `producedBy` link.
+- **Re-attach-on-reap**: if a child run is reaped, the engine re-attaches via `findChildByParent`.
+- **Re-provide-on-input-move**: if a mapped parent artifact is invalidated, the engine re-provides it to the child.

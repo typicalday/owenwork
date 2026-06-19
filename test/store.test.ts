@@ -353,3 +353,55 @@ test('alarm_at survives a process restart (file-backed round-trip)', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- M2-LINK: producedBy round-trip and reverse-lookup tests -----------------
+
+test('insertWorkflow round-trips producedBy coordinates', () => {
+  const s = mem();
+  const id = randId('wf');
+  s.insertWorkflow(id, { def: 'delivery' }, { parentWf: 'wf_parent', parentPath: 'deliver' });
+  const got = s.getWorkflow(id);
+  assert.ok(got !== undefined, 'workflow must be retrievable');
+  assert.deepEqual(got.producedBy, { parentWf: 'wf_parent', parentPath: 'deliver' });
+  s.close();
+});
+
+test('insertWorkflow without producedBy has producedBy undefined', () => {
+  const s = mem();
+  const id = randId('wf');
+  s.insertWorkflow(id, { def: 'delivery' });
+  const got = s.getWorkflow(id);
+  assert.ok(got !== undefined, 'workflow must be retrievable');
+  assert.equal(got.producedBy, undefined);
+  s.close();
+});
+
+test('findChildByParent returns the child workflow row', () => {
+  const s = mem();
+  const parentWf = randId('wf');
+  const childId = randId('wf');
+  const otherId = randId('wf');
+
+  // Insert child with producedBy
+  s.insertWorkflow(childId, { def: 'delivery' }, { parentWf, parentPath: 'deliver' });
+  // Insert another workflow without producedBy
+  s.insertWorkflow(otherId, { def: 'delivery' });
+
+  const found = s.findChildByParent(parentWf, 'deliver');
+  assert.ok(found !== undefined, 'findChildByParent must return the child');
+  assert.equal(found.id, childId);
+  assert.deepEqual(found.producedBy, { parentWf, parentPath: 'deliver' });
+
+  // Other workflow must not be returned
+  const other = s.findChildByParent(parentWf, 'other-path');
+  assert.equal(other, undefined, 'findChildByParent must not return unrelated rows');
+
+  s.close();
+});
+
+test('findChildByParent returns undefined when no match', () => {
+  const s = mem();
+  const found = s.findChildByParent('wf_does_not_exist', 'deliver');
+  assert.equal(found, undefined);
+  s.close();
+});

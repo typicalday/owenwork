@@ -412,7 +412,51 @@ After loading, the expanded def's loops are:
 - **Collection loops** in the child prefix correctly: `source[]` → `deliver.source[]`; seal and element paths follow from the prefixed stem.
 - **Nested includes** work recursively; cycles are a hard error.
 
-**Constraint:** Mode 1 inlines the child's namespace into the parent. Use it for **brand-new combined workflows** where no downstream tooling expects the old loop names. The existing `delivery` workflow's loops (`planner`, `builder`, `reviewer`, `merger`) become `deliver.planner` etc. — correct for a new `full-cycle` workflow, but would break `dev` tooling that expects the original names. For embedding an existing workflow as an encapsulated unit, use Mode 2 (`calls:`, a later PR).
+**Constraint:** Mode 1 inlines the child's namespace into the parent. Use it for **brand-new combined workflows** where no downstream tooling expects the old loop names. The existing `delivery` workflow's loops (`planner`, `builder`, `reviewer`, `merger`) become `deliver.planner` etc. — correct for a new `full-cycle` workflow, but would break `dev` tooling that expects the original names. For embedding an existing workflow as an encapsulated unit, use Mode 2 (`calls:`).
+
+### Workflow composition (Mode 2 — runtime `calls:`)
+
+Mode 2 is the **runtime** sibling of Mode 1. Instead of inlining a child workflow's loops at compile time, a `calls:` loop delegates to a **separate child workflow instance** at runtime. The calls: loop is machine-handled — it never emits a worker order.
+
+> **This is the static foundation (PR5a).** The grammar, validation, cross-def cycle check, and `producedBy` parent-coordinate storage are implemented. Runtime behavior (spawn, cascade-up, outcome propagation) lands in PR5b.
+
+```yaml
+name: provisioned-delivery
+
+inputs:
+  - name: proposal
+    seedOwed: true
+
+loops:
+  - name: deliver
+    calls: delivery          # child workflow name (must exist in the same def directory)
+    inputs:                  # optional: child input name → parent artifact name
+      proposal: proposal
+    produces: [delivered]    # exactly one parent artifact (the outcome artifact)
+
+  - name: teardown
+    consumes: [delivered]
+    produces: [torn_down]
+    terminal: true
+    body: |
+      Tear down and green `torn_down`.
+```
+
+Grammar rules:
+- `calls:` names a workflow that exists in the same def directory (resolver namespace).
+- `inputs:` keys must be declared inputs of the child workflow; values must be real parent artifacts (inputs or loop produces).
+- `produces:` must declare exactly one artifact (the parent artifact the child outcome feeds).
+- A `calls:` loop has no `body:` — it is machine-handled, never a worker firing.
+- Cross-def `calls:` cycles are detected at load time and reported as `calls cycle: a -> b -> a`. This check is separate from the `include:` cycle guard.
+
+**Mode 1 vs Mode 2:**
+
+| | Mode 1 `include:` | Mode 2 `calls:` |
+|---|---|---|
+| When | Compile-time (load time) | Runtime (per instance) |
+| Loops | Inlined with `as:` prefix | Run in a separate child instance |
+| Use for | New combined workflows | Embedding an existing workflow as a black box |
+| Output visibility | All child stems visible in parent namespace | Only the declared `produces:` artifact |
 
 ### `effect:` — the loop effect contract
 

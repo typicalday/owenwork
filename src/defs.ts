@@ -59,6 +59,15 @@ interface RawLoop {
   on?: unknown;
   idleAfter?: unknown;
   body?: unknown;
+  /** M2-GRAMMAR: if present, this entry is a calls: loop (Mode 2 runtime composition). */
+  calls?: unknown;
+}
+/** Duck-typed sniffer for a raw calls: directive (Mode 2). */
+interface RawCalls {
+  name?: unknown;
+  calls?: unknown;
+  inputs?: unknown;
+  produces?: unknown;
 }
 /** Duck-typed sniffer for a raw include directive. */
 interface RawInclude {
@@ -148,6 +157,11 @@ export class DefError extends Error {}
 /** Duck-check: does this raw loop-list entry look like an include directive? */
 function isIncludeDirective(v: unknown): boolean {
   return typeof v === 'object' && v !== null && 'include' in v;
+}
+
+/** Duck-check: does this raw loop-list entry look like a calls: directive (M2-GRAMMAR)? */
+function isCallsDirective(v: unknown): boolean {
+  return typeof v === 'object' && v !== null && 'calls' in v && !('include' in v);
 }
 
 /** Parse and validate a raw include directive (M1-GRAMMAR pre-checks). */
@@ -544,6 +558,43 @@ export function parseDef(raw: unknown, source?: string): WorkflowDef {
 }
 
 function buildLoop(rl: RawLoop, i: number): LoopDef {
+  // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: loop (Mode 2).
+  if (typeof rl.calls !== 'undefined') {
+    const rawCalls = rl as RawCalls;
+    const name = asString(rawCalls.name, `loops[${i}].name`);
+    const callsTarget = asString(rawCalls.calls, `loop '${name}'.calls`);
+    // parse inputs: optional mapping of child input name -> parent artifact name
+    const callsInputs: Record<string, string> = {};
+    if (rawCalls.inputs !== undefined) {
+      if (typeof rawCalls.inputs !== 'object' || rawCalls.inputs === null || Array.isArray(rawCalls.inputs)) {
+        throw new DefError(`loop '${name}'.inputs: must be an object mapping child input names to parent artifact names`);
+      }
+      for (const [k, v] of Object.entries(rawCalls.inputs as Record<string, unknown>)) {
+        if (typeof v !== 'string') throw new DefError(`loop '${name}'.inputs: value for key '${k}' must be a string`);
+        callsInputs[k] = v;
+      }
+    }
+    // parse produces: (required; exactly one — enforced by validateDef)
+    const producesPatterns = parseProduces(rawCalls.produces, `loop '${name}'.produces`);
+    const loop: LoopDef = {
+      name,
+      calls: callsTarget,
+      callsInputs,
+      consumes: [],          // calls: loops have no consumes in LoopDef (eligibility is engine-managed)
+      produces: producesPatterns,
+      invalidates: [],
+      cadence: DEFAULTS.cadence,
+      cadenceSecs: 0,
+      maxRunsPerDay: DEFAULTS.maxRunsPerDay,
+      parallel: 1,
+      maxAttempts: 1,        // never worker-fired; 1 is a safe non-zero sentinel
+      maxSchemaFailures: DEFAULTS.maxSchemaFailures,
+      workdir: DEFAULTS.workdir,
+      body: '',              // machine-handled: no prompt body
+    };
+    return loop;
+  }
+
   const name = asString(rl.name, `loops[${i}].name`);
   const consumes = asStringArray(rl.consumes, `loop '${name}'.consumes`).map(parseConsume);
   const producesPatterns = parseProduces(rl.produces, `loop '${name}'.produces`);
@@ -773,6 +824,26 @@ export function validateDef(def: WorkflowDef): string[] {
     }
   }
 
+  // M2-VALIDATE: calls: loop per-def rules.
+  // Note: cross-def checks (target-def existence, child input-key validity) cannot be done here
+  // because validateDef is a pure per-def function with no resolver. Those checks live in loadDefs
+  // Phase 2, analogous to how expandIncludes validates include input-key mappings.
+  for (const l of def.loops) {
+    if (!l.calls) continue;
+    // (a) calls: loop must produce exactly one output (one child, one outcome path — v1)
+    if (l.produces.length !== 1) {
+      errors.push(`calls: loop '${l.name}' must produce exactly one output (got ${l.produces.length})`);
+    }
+    // (b) callsInputs VALUES must be real parent artifacts (inputs or loop-produced stems)
+    for (const [, parentArtifact] of Object.entries(l.callsInputs ?? {})) {
+      if (!producerOf.has(parentArtifact)) {
+        errors.push(
+          `calls: loop '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any loop or input`,
+        );
+      }
+    }
+  }
+
   // Semantic invariant validation: unknown stem references and duplicate names.
   if (def.invariants && def.invariants.length > 0) {
     const invariantNames = new Set<string>();
@@ -939,6 +1010,44 @@ export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[
   return { errors, warnings };
 }
 
+// ---- M2-CYCLE: cross-def calls-cycle detection --------------------------------
+
+/**
+ * Walk the calls: edges in a flat def map and throw a DefError if any cycle exists.
+ * This is the Mode 2 analogue of the Mode 1 include-cycle guard in expandIncludes.
+ * Note: include: and calls: are DIFFERENT edge kinds — they are checked separately.
+ *
+ * Called from loadDefs Phase 2 after all defs are expanded and per-def validated.
+ */
+function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
+  const WHITE = 0, GREY = 1, BLACK = 2;
+  const color = new Map<string, number>([...defs.keys()].map((k) => [k, WHITE]));
+  const stack: string[] = [];
+
+  const visit = (name: string): void => {
+    color.set(name, GREY);
+    stack.push(name);
+    const def = defs.get(name);
+    // Unique calls: edges from this def (multiple loops might call the same child)
+    const callsEdges = new Set((def?.loops ?? []).filter((l) => l.calls).map((l) => l.calls!));
+    for (const child of callsEdges) {
+      if (!defs.has(child)) continue; // missing-def error is reported separately in loadDefs
+      const c = color.get(child) ?? WHITE;
+      if (c === GREY) {
+        const from = stack.indexOf(child);
+        throw new DefError(`calls cycle: ${[...stack.slice(from), child].join(' -> ')}`);
+      }
+      if (c === WHITE) visit(child);
+    }
+    stack.pop();
+    color.set(name, BLACK);
+  };
+
+  for (const name of defs.keys()) {
+    if ((color.get(name) ?? WHITE) === WHITE) visit(name);
+  }
+}
+
 // ---- filesystem loading ------------------------------------------------------
 
 /** Load and validate a single workflow definition from a YAML file. */
@@ -987,11 +1096,28 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
     }
   }
 
-  // Phase 2: expand includes and validate each def.
+  // Phase 2: expand includes, run per-def validation, and cross-def calls: checks.
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {
     const expanded = expandIncludes(def, resolver);
+
+    // M2-VALIDATE cross-def: target-def existence + child input-key validity.
+    // These cannot live in validateDef (pure per-def, no resolver) — same split as expandIncludes.
+    for (const l of expanded.loops) {
+      if (!l.calls) continue;
+      const childDef = resolver(l.calls);
+      if (!childDef) {
+        throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
+      }
+      const childInputNames = new Set(childDef.inputs.map((i) => i.name));
+      for (const k of Object.keys(l.callsInputs ?? {})) {
+        if (!childInputNames.has(k)) {
+          throw new DefError(`calls '${l.name}' maps input '${k}' which workflow '${l.calls}' does not declare`);
+        }
+      }
+    }
+
     const errors = validateDef(expanded);
     if (errors.length) {
       throw new DefError(
@@ -1000,6 +1126,10 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
     }
     out.set(name, expanded);
   }
+
+  // M2-CYCLE: detect calls: cycles over the full expanded def map (after all per-def checks pass).
+  detectCallsCycles(out);
+
   return out;
 }
 
@@ -1049,5 +1179,13 @@ export function loadDefsRaw(dir: string): Map<string, WorkflowDef> {
       out.set(name, def);
     }
   }
+
+  // M2-CYCLE: best-effort calls-cycle check so lint can surface cycle errors.
+  try {
+    detectCallsCycles(out);
+  } catch {
+    // Cycle errors are surfaced via validateDef in the lint caller; swallow here.
+  }
+
   return out;
 }

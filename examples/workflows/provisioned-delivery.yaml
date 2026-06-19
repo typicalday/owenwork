@@ -1,0 +1,50 @@
+# Provision → deliver (via calls:) → teardown.
+#
+# Demonstrates the Mode 2 `calls:` grammar (PR5a static foundation).
+# The `deliver` loop delegates to the `delivery` workflow at runtime —
+# PR5b will add the actual spawn/cascade-up/outcome-read behavior.
+#
+# Static guarantees provided by this PR:
+#   - Grammar: `calls: delivery` with `inputs:` wiring is parsed and validated.
+#   - `deliver` is excluded from eligibleFirings (machine-handled, not a worker loop).
+#   - The `delivered` artifact is seeded as owed — a normal debt until PR5b greens it.
+#   - Cross-def calls: cycle check prevents delivery calling back to provisioned-delivery.
+#
+# Drive it (once PR5b lands):
+#   wf=$(oweflow create provisioned-delivery | jq -r .workflow)
+#   oweflow tick $wf   # -> orders: provision
+#   ...
+
+name: provisioned-delivery
+title: Provision → deliver (Mode 2 calls:) → teardown
+description: |
+  Parent workflow demonstrating the calls: grammar (PR5a foundation).
+  Runtime cascade-up behavior (spawn, green via child outcome) is PR5b.
+
+inputs:
+  - name: proposal
+    seedOwed: true
+
+loops:
+  - name: provision
+    consumes: [proposal]
+    produces: [sandbox]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Provision a sandbox environment for the proposal.
+      Green `sandbox` with the environment details.
+
+  - name: deliver
+    calls: delivery
+    inputs:
+      proposal: proposal
+    produces: [delivered]
+
+  - name: teardown
+    consumes: [delivered, sandbox]
+    produces: [torn_down]
+    terminal: true
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Tear down the sandbox environment.
+      Green `torn_down` to complete the workflow.

@@ -357,6 +357,9 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
   const firings: Firing[] = [];
 
   for (const loop of def.loops) {
+    // M2: calls: loops are machine-handled (PR5b spawns the child); never emit a worker firing.
+    if (loop.calls) continue;
+
     const triggers = resolvedTriggers(loop);
     const hasInputsGreen = triggers.includes('inputsGreen');
     const hasAllGreen = triggers.includes('allGreen');
