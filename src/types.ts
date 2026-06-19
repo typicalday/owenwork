@@ -109,6 +109,8 @@ export interface RunData {
   sessionId?: string;
   /** the version of every consumed input at claim time (§12.2 commit CAS) */
   fingerprint?: Fingerprint;
+  /** The firing trigger that woke this run (§21). Absent = 'inputsGreen'. */
+  cause?: FiringTrigger;
 }
 
 export interface WorkflowData {
@@ -142,6 +144,14 @@ export interface ProducePattern {
   /** optional JSON Schema the produced value must satisfy at commit time (§19) */
   schema?: JsonSchema;
 }
+
+/**
+ * A loop-level trigger token that controls when the loop is eligible to fire.
+ * - 'inputsGreen' (default) — classic behaviour: fire when consumed inputs are green.
+ * - 'allGreen' — fire when the workflow is all-green (no debts among non-evaluator artifacts).
+ * Extend with 'idle' in PR3b.
+ */
+export type FiringTrigger = 'inputsGreen' | 'allGreen';
 
 /**
  * Declared per-loop effect contract (design §6.5). Controls forward-cascade routing
@@ -183,6 +193,8 @@ export interface LoopDef {
   terminal?: boolean;
   /** Loop-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */
   effect?: EffectDef;
+  /** Loop-level firing trigger (§21). Omitted = ['inputsGreen'] (default behaviour). */
+  on?: FiringTrigger[];
   body: string; // prompt body
 }
 

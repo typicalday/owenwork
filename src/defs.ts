@@ -26,7 +26,7 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { Acceptance, EffectDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, EffectDef, FiringTrigger, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -56,6 +56,7 @@ interface RawLoop {
   workdir?: unknown;
   terminal?: unknown;
   effect?: unknown;
+  on?: unknown;
   body?: unknown;
 }
 interface RawDef {
@@ -324,6 +325,22 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
     }
     loop.effect = effectDef;
   }
+  if (rl.on !== undefined) {
+    const rawOn = asStringArray(rl.on, `loop '${name}'.on`);
+    if (rawOn.length === 0) {
+      throw new DefError(`loop '${name}'.on must not be empty; a loop must have at least one firing trigger`);
+    }
+    for (const tok of rawOn) {
+      if (tok !== 'inputsGreen' && tok !== 'allGreen') {
+        throw new DefError(
+          `loop '${name}': on: token '${tok}' is not supported; ` +
+          `supported tokens now: 'inputsGreen', 'allGreen'. ` +
+          `The 'idle' trigger (and any time/alarm machinery) is a planned follow-up (PR3b).`,
+        );
+      }
+    }
+    loop.on = rawOn as FiringTrigger[];
+  }
   return loop;
 }
 
@@ -462,6 +479,23 @@ export function validateDef(def: WorkflowDef): string[] {
         `loop '${l.name}': effect.onInvalidate must be 'pin' or 'escalate'; ` +
         `named-handler routing ('${oi}') is not yet supported and is a planned follow-up`,
       );
+    }
+  }
+
+  // on: token validation — belt-and-suspenders over buildLoop's throw
+  for (const l of def.loops) {
+    if (!l.on) continue;
+    if (l.on.length === 0) {
+      errors.push(`loop '${l.name}': on: must not be empty; a loop must have at least one firing trigger`);
+    }
+    for (const tok of l.on) {
+      if (tok !== 'inputsGreen' && tok !== 'allGreen') {
+        errors.push(
+          `loop '${l.name}': on: token '${tok}' is not supported; ` +
+          `supported now: 'inputsGreen', 'allGreen'. ` +
+          `The 'idle' trigger is a planned follow-up (PR3b).`,
+        );
+      }
     }
   }
 

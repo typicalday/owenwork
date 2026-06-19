@@ -192,6 +192,28 @@ test('deleteWorkflow cascades to artifacts/tasks/runs', () => {
   s.close();
 });
 
+test('run cause round-trips through insert and update', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const r1 = randId('run');
+  const r2 = randId('run');
+
+  // insert with cause set — must survive to getRun
+  s.insertRun(r1, { workflow: wf, loop: 'builder', cause: 'allGreen' });
+  const got = s.getRun(r1);
+  assert.equal(got?.cause, 'allGreen', 'cause persists through insertRun');
+
+  // insert without cause — must be absent (not undefined-as-string)
+  s.insertRun(r2, { workflow: wf, loop: 'builder' });
+  assert.equal(s.getRun(r2)?.cause, undefined, 'absent cause stays absent');
+
+  // updateRun can set cause after the fact
+  s.updateRun(r2, { cause: 'inputsGreen' });
+  assert.equal(s.getRun(r2)?.cause, 'inputsGreen', 'cause survives updateRun');
+
+  s.close();
+});
+
 test('listRuns returns all runs for a workflow ordered by created_at, rowid', () => {
   const s = mem();
   const wf = randId('wf');

@@ -958,3 +958,82 @@ test('lintDef: dead-end warning message mentions outputs:', () => {
     `expected warning mentioning outputs:; got: ${warnings.join('; ')}`,
   );
 });
+
+// ---- (f) on: firing-trigger validation ----------------------------------------
+
+// (f1) on: ['idle'] → hard error mentioning PR3b
+test('parseDef: on: [idle] is a hard error mentioning PR3b', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'wf',
+      inputs: [{ name: 'seed' }],
+      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
+    }),
+    (e: unknown) => {
+      assert.ok(e instanceof DefError);
+      assert.ok((e as Error).message.includes('idle') || (e as Error).message.includes('PR3b'));
+      return true;
+    },
+  );
+});
+
+// (f2) on: ['unknown_token'] → hard error
+test('parseDef: on: [unknown_token] is a hard error', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'wf',
+      inputs: [{ name: 'seed' }],
+      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['unknown_token'] }],
+    }),
+    DefError,
+  );
+});
+
+// (f3) on: [] → hard error 'must not be empty'
+test('parseDef: on: [] is a hard error (must not be empty)', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'wf',
+      inputs: [{ name: 'seed' }],
+      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: [] }],
+    }),
+    (e: unknown) => {
+      assert.ok(e instanceof DefError);
+      assert.ok((e as Error).message.includes('empty') || (e as Error).message.includes('must not be empty'));
+      return true;
+    },
+  );
+});
+
+// (f4) on: ['inputsGreen'] → valid
+test('parseDef: on: [inputsGreen] is valid', () => {
+  const d = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['inputsGreen'] }],
+  });
+  assert.deepEqual(d.loops[0]!.on, ['inputsGreen']);
+});
+
+// (f5) on: ['allGreen'] → valid (evaluator with generates: so no dead-end warning)
+test('parseDef: on: [allGreen] is valid', () => {
+  const d = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'planner', consumes: ['seed'], produces: ['plan'] },
+      { name: 'eval', on: ['allGreen'], generates: ['outcome'], consumes: [], body: '' },
+    ],
+  });
+  assert.deepEqual(d.loops[1]!.on, ['allGreen']);
+});
+
+// (f6) on: omitted → valid (default behaviour — on is undefined)
+test('parseDef: on: omitted → valid, on is undefined', () => {
+  const d = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'] }],
+  });
+  assert.equal(d.loops[0]!.on, undefined);
+});

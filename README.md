@@ -325,12 +325,26 @@ loops:
                                #   'pin'      → keep green, re-point fingerprint (stays up-to-date)
                                #   'escalate' → reject-and-hold; stall requires human intervention
                                #   Named-handler strings are a planned follow-up (hard error today)
+    on: [inputsGreen]          # optional; firing trigger (§21). Values:
+                               #   'inputsGreen' (default) — fire when consumed inputs are green
+                               #   'allGreen'               — fire when workflow is done (completion evaluator)
+                               #   Omit for classic inputsGreen behaviour; on:[] is a hard error.
     invalidates: [plan]        # which input stems this loop may invalidate
                                #   (default: its consumed stems)
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
     model: …                   # opaque hint passed through on the order
     workdir: main              # opaque hint passed through on the order
+```
+
+**Completion evaluator example:**
+
+```yaml
+- name: completion
+  on: [allGreen]           # firing trigger: fires when the workflow is done
+  generates: [outcome]     # evaluator's outcome — lint-exempt, public interface
+  body: |
+    # runs when the workflow is done; inspect and green outcome
 ```
 
 ### `produces:` vs `generates:`
@@ -389,6 +403,22 @@ structural regardless of `effect:` — only the moved-version re-arm path routes
 | `effect: { idempotent: false, onInvalidate: 'pin' }` | false | pin | stay green, re-point fingerprint |
 | `effect: { idempotent: false, onInvalidate: 'escalate' }` | false | escalate | reject-and-hold; stalled |
 | `terminal: true` | false | pin | stay green + lint-exempt (legacy) |
+
+### `on:` — the loop firing trigger
+
+By default, a loop fires when its consumed inputs are all green (`inputsGreen`). The optional `on:` field makes the trigger explicit and swappable.
+
+- **`on:` omitted** — equivalent to `on: ['inputsGreen']`. All existing defs behave exactly as before.
+- **`on: ['inputsGreen']`** — explicit default. Fire when consumed inputs are green.
+- **`on: ['allGreen']`** — completion evaluator mode (§21). The loop fires when the workflow is "all-green" — no outstanding debts among all artifacts except the evaluator's own produced outputs (bootstrap exclusion). Use for a loop that inspects the completed workflow and emits an `outcome` artifact.
+- **`on: []`** — hard error: a loop must have at least one firing trigger.
+- **`idle` and time-based triggers** — planned for PR3b; any other `on:` token is a hard error.
+
+**Bootstrap exclusion:** the evaluator's own `outcome` is excluded from the all-green check so that "all other artifacts are done" can be true before the evaluator runs.
+
+**Re-arm:** once `outcome` is green, if the workflow later falls back out of all-green (e.g. an upstream input is re-provided), `maintainDecisions` detects that `outcome` is green but the workflow is no longer all-green, and emits a structural reject to re-arm `outcome`. The evaluator re-fires automatically when the workflow returns to all-green.
+
+**`cause` in the order:** the engine threads the trigger onto `order.cause` (e.g. `'allGreen'`). A worker can read `order.cause` to branch behaviour — for example, a completion evaluator may inspect status, green `outcome`, and message a human.
 
 ### Consume / produce grammar
 

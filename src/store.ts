@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS run (
   summary     TEXT,
   session_id  TEXT,
   fingerprint TEXT,
+  cause       TEXT,
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
@@ -212,6 +213,7 @@ interface RunRowRaw {
   summary: string | null;
   session_id: string | null;
   fingerprint: string | null;
+  cause: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -230,6 +232,7 @@ function mapRun(r: RunRowRaw): RunRow {
   if (r.session_id !== null) out.sessionId = r.session_id;
   const fp = fromJson<Fingerprint | undefined>(r.fingerprint, undefined);
   if (fp !== undefined) out.fingerprint = fp;
+  if (r.cause !== null) out.cause = r.cause as RunData['cause'];
   return out;
 }
 
@@ -280,9 +283,13 @@ export class Store {
    * idempotent — safe to run on every open.
    */
   private migrate(): void {
-    const cols = this.db.prepare(`PRAGMA table_info(artifact)`).all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === 'schema_rejects')) {
+    const artifactCols = this.db.prepare(`PRAGMA table_info(artifact)`).all() as Array<{ name: string }>;
+    if (!artifactCols.some((c) => c.name === 'schema_rejects')) {
       this.db.exec(`ALTER TABLE artifact ADD COLUMN schema_rejects INTEGER NOT NULL DEFAULT 0`);
+    }
+    const runCols = this.db.prepare(`PRAGMA table_info(run)`).all() as Array<{ name: string }>;
+    if (!runCols.some((c) => c.name === 'cause')) {
+      this.db.exec(`ALTER TABLE run ADD COLUMN cause TEXT`);
     }
   }
 
@@ -463,11 +470,11 @@ export class Store {
   insertRun(id: string, data: RunData, at: number = nowMs()): RunRow {
     this.db
       .prepare(
-        `INSERT INTO run (id, workflow, loop, key, outcome, summary, session_id, fingerprint, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run (id, workflow, loop, key, outcome, summary, session_id, fingerprint, cause, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(id, data.workflow, data.loop, data.key ?? '', data.outcome ?? null, data.summary ?? null,
-        data.sessionId ?? null, toJson(data.fingerprint), at, at);
+        data.sessionId ?? null, toJson(data.fingerprint), data.cause ?? null, at, at);
     return this.getRun(id) as RunRow;
   }
 
@@ -482,13 +489,14 @@ export class Store {
       summary: patch.summary ?? cur.summary,
       sessionId: patch.sessionId ?? cur.sessionId,
       fingerprint: patch.fingerprint ?? cur.fingerprint,
+      cause: patch.cause ?? cur.cause,
     };
     this.db
       .prepare(
-        'UPDATE run SET key = ?, outcome = ?, summary = ?, session_id = ?, fingerprint = ?, updated_at = ? WHERE id = ?',
+        'UPDATE run SET key = ?, outcome = ?, summary = ?, session_id = ?, fingerprint = ?, cause = ?, updated_at = ? WHERE id = ?',
       )
       .run(merged.key ?? '', merged.outcome ?? null, merged.summary ?? null, merged.sessionId ?? null,
-        toJson(merged.fingerprint), nowMs(), id);
+        toJson(merged.fingerprint), merged.cause ?? null, nowMs(), id);
     return this.getRun(id) as RunRow;
   }
 

@@ -37,6 +37,7 @@ import type {
   Author,
   JsonSchema,
   LoopDef,
+  FiringTrigger,
   ReasonEntry,
   RejectKind,
   ReasonAction,
@@ -67,6 +68,8 @@ export interface Order {
     schemaRejects: number;
     reasons: ReasonEntry[];
   }>;
+  /** The trigger that woke this firing (§21). Absent = 'inputsGreen'. */
+  cause?: FiringTrigger;
 }
 
 /**
@@ -351,7 +354,7 @@ export class Engine {
     const runId = randId('run');
     const fp = computeFingerprint(arts, f.inputs);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
-    this.store.insertRun(runId, { workflow, loop: f.loop, key: f.key, fingerprint: fp }, now);
+    this.store.insertRun(runId, { workflow, loop: f.loop, key: f.key, fingerprint: fp, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
       workflow,
       loop: f.loop,
@@ -408,6 +411,7 @@ export class Engine {
     };
     if (f.index !== undefined) order.index = f.index;
     if (loop.model !== undefined) order.model = loop.model;
+    if (f.cause !== undefined) order.cause = f.cause;
     return order;
   }
 

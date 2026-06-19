@@ -1,7 +1,7 @@
 /** Shared test fixtures — inline workflow/loop builders and an artifact-map helper. */
 
 import { parseConsume, parseProduce } from '../src/paths.ts';
-import type { ArtifactData, EffectDef, InputDef, LoopDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, EffectDef, FiringTrigger, InputDef, LoopDef, WorkflowDef } from '../src/types.ts';
 import type { ArtifactMap } from '../src/model.ts';
 
 export interface LoopSpec {
@@ -20,6 +20,7 @@ export interface LoopSpec {
   body?: string;
   terminal?: boolean;
   effect?: EffectDef;
+  on?: FiringTrigger[];
 }
 
 export function loop(spec: LoopSpec): LoopDef {
@@ -39,6 +40,7 @@ export function loop(spec: LoopSpec): LoopDef {
     ...(spec.model !== undefined ? { model: spec.model } : {}),
     ...(spec.terminal !== undefined ? { terminal: spec.terminal } : {}),
     ...(spec.effect !== undefined ? { effect: spec.effect } : {}),
+    ...(spec.on !== undefined ? { on: spec.on } : {}),
     workdir: spec.workdir ?? 'main',
     body: spec.body ?? `run ${spec.name}`,
   };

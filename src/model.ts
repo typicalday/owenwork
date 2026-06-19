@@ -26,6 +26,7 @@ import type {
   CheckReport,
   CheckStep,
   ConsumePattern,
+  FiringTrigger,
   Fingerprint,
   GraphEdge,
   GraphNode,
@@ -49,6 +50,8 @@ export interface Firing {
   index?: number; // the bound element index, for map firings
   inputs: string[]; // concrete consumed input paths (all green) — the claim fingerprint domain
   outputs: string[]; // concrete owed/rejected output paths this firing discharges
+  /** The trigger that made this firing eligible (§21). Absent means 'inputsGreen'. */
+  cause?: FiringTrigger;
 }
 
 /** A structural maintenance op the engine should apply (level-triggered). */
@@ -144,6 +147,25 @@ function resolvedEffect(loop: LoopDef | undefined): { idempotent: boolean; onInv
   const idempotent = loop?.effect?.idempotent ?? true;
   const onInvalidate = loop?.effect?.onInvalidate ?? 'escalate';
   return { idempotent, onInvalidate };
+}
+
+/** The effective set of firing triggers for a loop. Defaults to ['inputsGreen']. */
+function resolvedTriggers(loop: LoopDef): FiringTrigger[] {
+  return loop.on ?? ['inputsGreen'];
+}
+
+/**
+ * Returns true when every artifact in `arts` is NOT a debt, excluding any
+ * artifact whose path is in `excludePaths`. Used for the allGreen trigger's
+ * bootstrap exclusion (the evaluator's own outputs are excluded from the check
+ * so that 'all-green except for the evaluator itself' can be true).
+ */
+function allArtifactsGreen(arts: ArtifactMap, excludePaths: ReadonlySet<string>): boolean {
+  for (const [path, a] of arts) {
+    if (excludePaths.has(path)) continue;
+    if (DEBT_STATES.has(a.acceptance)) return false;
+  }
+  return true;
 }
 
 function isSettledOut(a: ArtifactData): boolean {
@@ -278,68 +300,100 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
   const firings: Firing[] = [];
 
   for (const loop of def.loops) {
-    const mode = loopMode(loop);
-    const plain = plainConsumes(loop);
-    const plainPaths = plain.map((c) => c.stem);
-    const plainSatisfied = plainPaths.every((p) => isGreen(arts.get(p)));
+    const triggers = resolvedTriggers(loop);
+    const hasInputsGreen = triggers.includes('inputsGreen');
+    const hasAllGreen = triggers.includes('allGreen');
 
-    if (mode === 'plain') {
-      if (!plainSatisfied) continue;
-      const outs = plainOutputs(loop).filter((p) => {
-        const a = arts.get(p);
-        return isDebt(a) && !frozen(a, loop);
-      });
-      if (outs.length) {
-        firings.push({ loop: loop.name, key: '', inputs: plainPaths, outputs: outs });
+    if (hasInputsGreen) {
+      const mode = loopMode(loop);
+      const plain = plainConsumes(loop);
+      const plainPaths = plain.map((c) => c.stem);
+      const plainSatisfied = plainPaths.every((p) => isGreen(arts.get(p)));
+
+      if (mode === 'plain') {
+        if (plainSatisfied) {
+          const outs = plainOutputs(loop).filter((p) => {
+            const a = arts.get(p);
+            return isDebt(a) && !frozen(a, loop);
+          });
+          if (outs.length) {
+            firings.push({ loop: loop.name, key: '', inputs: plainPaths, outputs: outs });
+          }
+        }
+      } else if (mode === 'map') {
+        if (plainSatisfied) {
+          const mc = mapConsume(loop);
+          const mp = mapProduce(loop);
+          if (mc && mp) {
+            for (const m of members(arts, mc.stem)) {
+              if (!isGreen(m)) continue;
+              const el = parseElement(m.path);
+              if (!el) continue;
+              const outPath = bindProduce(mp, el.index);
+              const outArt = arts.get(outPath);
+              if (!isDebt(outArt) || frozen(outArt, loop)) continue;
+              firings.push({
+                loop: loop.name,
+                key: m.path,
+                index: el.index,
+                inputs: [m.path, ...plainPaths],
+                outputs: [outPath],
+              });
+            }
+          }
+        }
+      } else {
+        // reduce
+        const rc = reduceConsume(loop);
+        if (rc && plainSatisfied) {
+          const seal = arts.get(sealPath(rc.stem));
+          if (isGreen(seal)) {
+            const mem = members(arts, rc.stem);
+            const live = mem.filter((m) => !isSettledOut(m));
+            if (!live.some((m) => !isGreen(m))) {
+              const outs = singletonProduces(loop)
+                .map((p) => p.stem)
+                .filter((p) => {
+                  const a = arts.get(p);
+                  return isDebt(a) && !frozen(a, loop);
+                });
+              if (outs.length) {
+                firings.push({
+                  loop: loop.name,
+                  key: '',
+                  inputs: [...live.map((m) => m.path), sealPath(rc.stem), ...plainPaths],
+                  outputs: outs,
+                });
+              }
+            }
+          }
+        }
       }
-      continue;
     }
 
-    if (mode === 'map') {
-      if (!plainSatisfied) continue;
-      const mc = mapConsume(loop);
-      const mp = mapProduce(loop);
-      if (!mc || !mp) continue;
-      for (const m of members(arts, mc.stem)) {
-        if (!isGreen(m)) continue;
-        const el = parseElement(m.path);
-        if (!el) continue;
-        const outPath = bindProduce(mp, el.index);
-        const outArt = arts.get(outPath);
-        if (!isDebt(outArt) || frozen(outArt, loop)) continue;
-        firings.push({
-          loop: loop.name,
-          key: m.path,
-          index: el.index,
-          inputs: [m.path, ...plainPaths],
-          outputs: [outPath],
+    if (hasAllGreen) {
+      // Compute the set of output paths this evaluator loop produces.
+      // These are excluded from the all-green check (bootstrap exclusion).
+      const evaluatorOutputs = new Set<string>(plainOutputs(loop));
+
+      // The workflow is all-green (excluding the evaluator's own outputs).
+      const wfAllGreen = allArtifactsGreen(arts, evaluatorOutputs);
+      if (wfAllGreen) {
+        // Workflow IS all-green. Check if the evaluator still has a debt to discharge.
+        const outs = plainOutputs(loop).filter((p) => {
+          const a = arts.get(p);
+          return isDebt(a) && !frozen(a, loop);
         });
+        if (outs.length > 0) {
+          firings.push({
+            loop: loop.name,
+            key: '',
+            inputs: [], // allGreen loop has no consumed inputs to fingerprint
+            outputs: outs,
+            cause: 'allGreen',
+          });
+        }
       }
-      continue;
-    }
-
-    // reduce
-    const rc = reduceConsume(loop);
-    if (!rc) continue;
-    if (!plainSatisfied) continue;
-    const seal = arts.get(sealPath(rc.stem));
-    if (!isGreen(seal)) continue;
-    const mem = members(arts, rc.stem);
-    const live = mem.filter((m) => !isSettledOut(m));
-    if (live.some((m) => !isGreen(m))) continue; // a rejected/owed member blocks the reduce
-    const outs = singletonProduces(loop)
-      .map((p) => p.stem)
-      .filter((p) => {
-        const a = arts.get(p);
-        return isDebt(a) && !frozen(a, loop);
-      });
-    if (outs.length) {
-      firings.push({
-        loop: loop.name,
-        key: '',
-        inputs: [...live.map((m) => m.path), sealPath(rc.stem), ...plainPaths],
-        outputs: outs,
-      });
     }
   }
 
@@ -443,6 +497,33 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap): CascadeO
     // input (owed/rejected) is just blocked, not dead — leave it.
     if (isDebt(art) && offender && offenderPath && isSettledOut(offender)) {
       ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
+    }
+  }
+
+  // allGreen re-arm: a green outcome of an allGreen-triggered loop is re-armed
+  // when the workflow is no longer all-green (excluding the evaluator's own outputs).
+  // This ensures the evaluator re-fires if the workflow later falls out of done.
+  for (const loop of def.loops) {
+    const triggers = resolvedTriggers(loop);
+    if (!triggers.includes('allGreen')) continue;
+
+    // Compute this evaluator's output paths.
+    const evaluatorOutputPaths = plainOutputs(loop);
+    const evaluatorOutputSet = new Set<string>(evaluatorOutputPaths);
+
+    // Check workflow all-green status excluding this evaluator's outputs.
+    const wfAllGreen = allArtifactsGreen(arts, evaluatorOutputSet);
+    if (wfAllGreen) continue; // workflow is all-green — no re-arm needed (stable)
+
+    // Workflow is NOT all-green. Re-arm any green (non-terminal) evaluator output.
+    for (const path of evaluatorOutputPaths) {
+      const art = arts.get(path);
+      if (!art || art.acceptance !== 'green' || art.terminal) continue;
+      ops.push({
+        kind: 'reject',
+        path,
+        reason: 'allGreen-rearm: workflow fell out of done — re-evaluating',
+      });
     }
   }
 

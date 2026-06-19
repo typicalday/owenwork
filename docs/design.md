@@ -304,3 +304,15 @@ version (§7).
 - **§20.6 named-handler routing** — `onInvalidate: <loopName>` is a planned
   follow-up; any non-pin/escalate string is currently a hard `validateDef` error
   (and thrown immediately in `buildLoop`).
+
+## §21 Firing rules and the completion evaluator (`on:`)
+
+Every loop today is implicitly `on: [inputsGreen]` — fire when consumed inputs are green. `on:` makes the firing trigger explicit.
+
+- **§21.1 `inputsGreen` (default)** — the existing behaviour, unchanged. A loop whose `on:` is omitted, or explicitly set to `['inputsGreen']`, fires exactly as today.
+- **§21.2 `allGreen`** — the loop fires when the workflow is all-green: no outstanding debts among all artifacts *except the evaluator's own produced outputs* (bootstrap exclusion). Fires immediately on all-green (no delay — the `idle` trigger, which waits, is a planned follow-up, PR3b).
+- **§21.3 Bootstrap exclusion** — the evaluator's own owed `outcome` is not counted among the debts in the all-green check. Without this, the evaluator's firing could never be triggered (its own debt would prevent all-green).
+- **§21.4 Fall-out-of-done re-arm** — once `outcome` is green (done), if the workflow later falls out of all-green (a new debt appears — e.g. a re-provided input re-arms an upstream artifact), `maintainDecisions` detects that `outcome` is green but all-green no longer holds, and emits a structural reject to re-arm `outcome`. When the workflow returns to all-green, `eligibleFirings` offers the evaluator again. This is stable: `maintainDecisions` only emits the op when the workflow is NOT all-green but `outcome` IS green. After the reject is applied, `outcome` is a debt — the op is not re-emitted.
+- **§21.5 Trigger-cause** — the engine threads the cause ('allGreen') onto the `Firing`, the `RunData`, and the `Order`. A worker can read `order.cause` to branch behaviour (e.g. inspect status, green `outcome`, message a human).
+- **§21.6 One `outcome` output** — the evaluator loop produces exactly one singleton `outcome` artifact. This is the embedding boundary contract (§17): the outer workflow or teardown step consumes the child's `outcome`.
+- **§21.7 The `idle` trigger** — deferred to PR3b. Any `on:` token other than `inputsGreen` or `allGreen` is a hard `validateDef` / `buildLoop` error pointing at the PR3b follow-up.
