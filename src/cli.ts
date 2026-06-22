@@ -201,6 +201,7 @@ Commands:
   retract <wf> <path> --by <author> --text <msg>
   skip <wf> <path> --by <author> --text <msg>
   retry <wf> <path> [--by <author>] [--text <guidance>]   clear a §6 stall
+  heartbeat <wf> <run> [--now <ms>]    touch liveness timestamp on an open run
   close <wf> <run> [--outcome ok|no_work|failed|skipped] [--summary s]
   delete <wf>
 
@@ -519,6 +520,14 @@ function dispatch(command: string, io: CliIO, args: Args): void {
         const outcome = (last(args, 'outcome') ?? 'ok') as 'ok' | 'no_work' | 'failed' | 'skipped';
         engine.close(wf, run, outcome, last(args, 'summary'));
         print(io, { ok: true, run, outcome });
+        return;
+      }
+      case 'heartbeat': {
+        const wf = need(args, 1, 'workflow');
+        const run = need(args, 2, 'run');
+        const nowRaw = last(args, 'now');
+        engine.heartbeat(wf, run, nowRaw !== undefined ? Number(nowRaw) : undefined);
+        print(io, { ok: true, workflow: wf, run });
         return;
       }
       case 'delete': {

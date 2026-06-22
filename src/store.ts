@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS task (
   claimed_at  INTEGER,
   attempts    INTEGER NOT NULL DEFAULT 0,
   alarm_at    INTEGER,
+  heartbeat_at INTEGER,
   updated_at  INTEGER NOT NULL,
   UNIQUE (workflow, loop, key)
 );
@@ -127,7 +128,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-const SCHEMA_VERSION = '3';
+const SCHEMA_VERSION = '4';
 
 // ---- (de)serialization helpers ----------------------------------------------
 
@@ -188,6 +189,7 @@ interface TaskRowRaw {
   claimed_at: number | null;
   attempts: number;
   alarm_at: number | null;
+  heartbeat_at: number | null;
   updated_at: number;
 }
 
@@ -204,6 +206,7 @@ function mapTask(r: TaskRowRaw): TaskRow {
   if (r.run !== null) out.run = r.run;
   if (r.claimed_at !== null) out.claimedAt = r.claimed_at;
   if (r.alarm_at !== null) out.alarmAt = r.alarm_at;
+  if (r.heartbeat_at !== null) out.heartbeatAt = r.heartbeat_at;
   return out;
 }
 
@@ -302,6 +305,9 @@ export class Store {
     const taskCols = this.db.prepare(`PRAGMA table_info(task)`).all() as Array<{ name: string }>;
     if (!taskCols.some((c) => c.name === 'alarm_at')) {
       this.db.exec(`ALTER TABLE task ADD COLUMN alarm_at INTEGER`);
+    }
+    if (!taskCols.some((c) => c.name === 'heartbeat_at')) {
+      this.db.exec(`ALTER TABLE task ADD COLUMN heartbeat_at INTEGER`);
     }
     // M2-LINK (§4.2, R11): nullable parent-coordinate columns for calls: child instances.
     const wfCols = this.db.prepare(`PRAGMA table_info(workflow)`).all() as Array<{ name: string }>;
@@ -503,14 +509,15 @@ export class Store {
     const at = nowMs();
     this.db
       .prepare(
-        `INSERT INTO task (id, workflow, loop, key, status, run, claimed_at, attempts, alarm_at, updated_at)
-         VALUES (@id, @workflow, @loop, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @updated_at)
+        `INSERT INTO task (id, workflow, loop, key, status, run, claimed_at, attempts, alarm_at, heartbeat_at, updated_at)
+         VALUES (@id, @workflow, @loop, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @heartbeat_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            status = excluded.status,
            run = excluded.run,
            claimed_at = excluded.claimed_at,
            attempts = excluded.attempts,
            alarm_at = excluded.alarm_at,
+           heartbeat_at = excluded.heartbeat_at,
            updated_at = excluded.updated_at`,
       )
       .run({
@@ -523,6 +530,7 @@ export class Store {
         claimed_at: data.claimedAt ?? null,
         attempts: data.attempts,
         alarm_at: data.alarmAt ?? null,
+        heartbeat_at: data.heartbeatAt ?? null,
         updated_at: at,
       });
     return this.getTask(data.workflow, data.loop, data.key) as TaskRow;
@@ -552,6 +560,14 @@ export class Store {
     const id = taskId(workflow, loop, '');
     this.db.prepare('UPDATE task SET alarm_at = NULL, updated_at = ? WHERE id = ?')
       .run(nowMs(), id);
+  }
+
+  /** Update only heartbeat_at on the task row — targeted write, no read-modify-write. */
+  touchHeartbeat(workflow: string, loop: string, key: string, now: number): void {
+    const id = taskId(workflow, loop, key);
+    this.db.prepare(
+      'UPDATE task SET heartbeat_at = ?, updated_at = ? WHERE id = ?'
+    ).run(now, nowMs(), id);
   }
 
   /**

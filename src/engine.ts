@@ -417,7 +417,7 @@ export class Engine {
     this.maintainCalls(workflow, def, now);
     return this.store.tx(() => {
       this.settle(workflow, def, now);
-      const reaped = this.reap(workflow, now);
+      const reaped = this.reap(workflow, now, def);
 
       const arts = this.artMap(workflow);
 
@@ -498,6 +498,23 @@ export class Engine {
     return { selected, deferred };
   }
 
+  /** Return the effective reap TTL for a loop — per-loop override or engine default. */
+  private effectiveTtl(loop?: LoopDef): number {
+    return loop?.reapTtlMs ?? this.reapTtlMs;
+  }
+
+  /**
+   * Unified liveness predicate: returns true if the task's claim is still fresh.
+   * Uses max(claimedAt, heartbeatAt ?? claimedAt) as the freshness anchor so a
+   * heartbeating run is never falsely reaped even after the global TTL elapses.
+   */
+  private isClaimFresh(task: { claimedAt?: number; heartbeatAt?: number }, now: number, ttl: number): boolean {
+    const anchor = task.heartbeatAt !== undefined && task.heartbeatAt > (task.claimedAt ?? 0)
+      ? task.heartbeatAt
+      : (task.claimedAt ?? 0);
+    return now - anchor <= ttl;
+  }
+
   /** Claim a firing's lease via CAS, snapshot the fingerprint, open a run. */
   private claim(
     workflow: string,
@@ -509,10 +526,12 @@ export class Engine {
     const existing = this.store.getTask(workflow, f.loop, f.key);
     if (existing && existing.status === 'claimed') {
       const run = existing.run ? this.store.getRun(existing.run) : undefined;
+      const loopDef = def.loops.find((l) => l.name === f.loop);
+      const ttl = this.effectiveTtl(loopDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
-        (existing.claimedAt === undefined || now - existing.claimedAt <= this.reapTtlMs);
+        (existing.claimedAt === undefined || this.isClaimFresh(existing, now, ttl));
       if (fresh) return 'in-flight'; // genuinely in flight — don't double-claim
     }
 
@@ -894,13 +913,30 @@ export class Engine {
     this.triggerParentIfChild(workflow);
   }
 
+  /**
+   * Touch the liveness timestamp on an open run's task. A run that periodically
+   * calls heartbeat() will never be falsely reaped as long as beats arrive within
+   * the effective TTL. Throws (via openRun) if the run no longer holds its lease.
+   */
+  heartbeat(workflow: string, run: string, now?: number): void {
+    const ts = now ?? nowMs();
+    this.store.tx(() => {
+      // openRun enforces: exists, not closed, task.run === run
+      const r = this.openRun(workflow, run);
+      this.store.touchHeartbeat(workflow, r.loop, r.key ?? '', ts);
+    });
+  }
+
   /** Release stranded leases (claimed by a dead/closed run, or past the TTL). */
-  reap(workflow: string, now = nowMs()): number {
+  reap(workflow: string, now = nowMs(), def?: WorkflowDef): number {
+    const resolvedDef = def ?? this.defFor(workflow);
     let n = 0;
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
-      const stale = task.claimedAt !== undefined && now - task.claimedAt > this.reapTtlMs;
+      const loopDef = resolvedDef.loops.find((l) => l.name === task.loop);
+      const ttl = this.effectiveTtl(loopDef);
+      const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl);
       const stranded = !run || run.outcome !== undefined || stale;
       if (stranded) {
         this.store.putTask({
@@ -935,6 +971,9 @@ export class Engine {
       const key = el ? elementPath(el.stem, el.index) : '';
       const fr = this.store.recentFailedRuns(workflow, a.producer, key);
       if (fr > 0) d.failedRuns = fr;
+      // NEW: surface per-step attempts (lease-churn count)
+      const task = this.store.getTask(workflow, a.producer, key);
+      if (task && task.attempts > 0) d.attempts = task.attempts;
     }
     return st;
   }
@@ -1020,7 +1059,7 @@ export class Engine {
     now: number,
   ): TimeFacts {
     const lastProgressMs = this.store.lastProgressMs(workflow);
-    const inFlight = this.isInFlight(workflow, now);
+    const inFlight = this.isInFlight(workflow, now, def);
     const alarms = new Map<string, number>();
     for (const loop of def.loops) {
       if (!loop.on?.includes('idle')) continue;
@@ -1032,14 +1071,16 @@ export class Engine {
   }
 
   /** Returns true if any fresh claimed task exists for this workflow. */
-  private isInFlight(workflow: string, now: number): boolean {
+  private isInFlight(workflow: string, now: number, def: WorkflowDef): boolean {
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
+      const loopDef = def.loops.find((l) => l.name === task.loop);
+      const ttl = this.effectiveTtl(loopDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
-        (task.claimedAt === undefined || now - task.claimedAt <= this.reapTtlMs);
+        (task.claimedAt === undefined || this.isClaimFresh(task, now, ttl));
       if (fresh) return true;
     }
     return false;

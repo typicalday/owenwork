@@ -23,6 +23,7 @@ export interface LoopSpec {
   on?: FiringTrigger[];
   idleAfter?: string;
   idleAfterMs?: number;
+  reapTtlMs?: number;
 }
 
 export function loop(spec: LoopSpec): LoopDef {
@@ -45,6 +46,7 @@ export function loop(spec: LoopSpec): LoopDef {
     ...(spec.on !== undefined ? { on: spec.on } : {}),
     ...(spec.idleAfter !== undefined ? { idleAfter: spec.idleAfter } : {}),
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
+    ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
     workdir: spec.workdir ?? 'main',
     body: spec.body ?? `run ${spec.name}`,
   };

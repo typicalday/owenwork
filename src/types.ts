@@ -96,6 +96,8 @@ export interface TaskData {
   status: 'idle' | 'claimed';
   run?: string; // run uid holding the lease
   claimedAt?: number;
+  /** Last heartbeat timestamp (ms epoch). Updated by Engine.heartbeat(). */
+  heartbeatAt?: number;
   attempts: number; // reaper strikes (lease churn), distinct from artifact judgmentRejects
   /** Persisted alarm time (ms epoch) for idle evaluator loops. Stored in task row. */
   alarmAt?: number;
@@ -206,6 +208,8 @@ export interface LoopDef {
   idleAfter?: string;
   /** Parsed idleAfter in milliseconds. */
   idleAfterMs?: number;
+  /** Per-loop reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
+  reapTtlMs?: number;
   body: string; // prompt body
   /** Mode 2 foundation: name of the child workflow this loop delegates to. Machine-handled, never a worker firing. */
   calls?: string;

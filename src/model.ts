@@ -673,6 +673,12 @@ export interface WorkflowStatus {
      * is pure and never sets it. Absent when zero or unknown.
      */
     failedRuns?: number;
+    /**
+     * Reaper strikes (lease churn) for this step — how many times the task has
+     * been reaped and re-armed. Enriched by `engine.status()` from the task row.
+     * Absent when zero or unknown.
+     */
+    attempts?: number;
   }>;
   eligible: Firing[];
   blocked: Blocker[];

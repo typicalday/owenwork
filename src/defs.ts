@@ -24,7 +24,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
-import { parseDurationSecs } from './util.ts';
+import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
 import type { Acceptance, EffectDef, FiringTrigger, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
 
@@ -61,6 +61,7 @@ interface RawLoop {
   body?: unknown;
   /** M2-GRAMMAR: if present, this entry is a calls: loop (Mode 2 runtime composition). */
   calls?: unknown;
+  reapTtl?: unknown;
 }
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
 interface RawCalls {
@@ -652,6 +653,10 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
     const idleAfterStr = asString(rl.idleAfter, `loop '${name}'.idleAfter`);
     loop.idleAfter = idleAfterStr;
     loop.idleAfterMs = parseDurationSecs(idleAfterStr) * 1000;
+  }
+  if (rl.reapTtl !== undefined) {
+    const reapTtlStr = asString(rl.reapTtl, `loop '${name}'.reapTtl`);
+    loop.reapTtlMs = parseDurationMs(reapTtlStr);
   }
   return loop;
 }
