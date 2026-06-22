@@ -10,4 +10,5 @@ node_modules/
 coverage/
 
 # dev delivery-system scaffolding (local foreman state — not part of the library)
-.dev/
+.dev/*
+!.dev/checks.sh

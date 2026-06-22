@@ -29,8 +29,6 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      # npm ci builds better-sqlite3 from source; ubuntu runners carry the
-      # python/make/g++ toolchain node-gyp needs, so no extra setup.
       - run: npm ci
 
-      - run: npm run check
+      - run: bash .dev/checks.sh
