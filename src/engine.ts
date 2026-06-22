@@ -877,7 +877,14 @@ export class Engine {
       this.store.updateRun(run, patch);
       const task = this.store.getTask(workflow, r.loop, r.key ?? '');
       if (task && task.status === 'claimed' && task.run === run) {
-        this.store.putTask({ workflow, loop: r.loop, key: r.key ?? '', status: 'idle', attempts: task.attempts });
+        this.store.putTask({
+          workflow,
+          loop: r.loop,
+          key: r.key ?? '',
+          status: 'idle',
+          attempts: task.attempts,
+          ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
+        });
       }
     });
     // Closing releases a lease; it touches no artifact state, so there is no
@@ -902,6 +909,7 @@ export class Engine {
           key: task.key,
           status: 'idle',
           attempts: task.attempts + 1,
+          ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
         });
         n++;
       }
@@ -1187,7 +1195,14 @@ export class Engine {
     if (!r) return;
     const task = this.store.getTask(workflow, r.loop, r.key ?? '');
     if (task && task.status === 'claimed' && task.run === run) {
-      this.store.putTask({ workflow, loop: r.loop, key: r.key ?? '', status: 'idle', attempts: task.attempts });
+      this.store.putTask({
+        workflow,
+        loop: r.loop,
+        key: r.key ?? '',
+        status: 'idle',
+        attempts: task.attempts,
+        ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
+      });
     }
   }
 

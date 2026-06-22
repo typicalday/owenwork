@@ -884,6 +884,76 @@ test('idle trigger fires the evaluator loop when alarm is set and threshold is r
   assert.equal(typeof tAt.dueAt, 'number', 'dueAt must be a number');
 });
 
+// ---- Alarm survives close/reap; claim clears it ----
+
+test('alarm set before close is preserved; reap also preserves alarm; claim clears it', () => {
+  const idleDef = def('alarm-survive', [input('proposal')], [
+    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: 9_999_999 }),
+  ]);
+  const { engine, store } = makeEngine([idleDef], { reapTtlMs: 500 });
+  const wf = engine.createInstance('alarm-survive');
+  const ALARM = 99_999;
+
+  // Part A: alarm survives a normal close
+  const runId1 = 'run_close_test';
+  store.insertRun(runId1, { workflow: wf, loop: 'completion', key: '' }, 0);
+  store.putTask({ workflow: wf, loop: 'completion', key: '', status: 'claimed',
+    run: runId1, claimedAt: 1000, attempts: 0, alarmAt: ALARM });
+  engine.close(wf, runId1, 'ok');
+  assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'close() must not clear a freshly-set alarm');
+
+  // Part B: alarm survives reap
+  // (reapTtlMs=500; claimedAt=0; now=1000 => 1000-0=1000 > 500 => stale)
+  const runId2 = 'run_reap_test';
+  store.insertRun(runId2, { workflow: wf, loop: 'completion', key: '' }, 0);
+  store.putTask({ workflow: wf, loop: 'completion', key: '', status: 'claimed',
+    run: runId2, claimedAt: 0, attempts: 1, alarmAt: ALARM });
+  engine.reap(wf, 1000);
+  assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'reap() must not clear a set alarm');
+
+  // Part C: claim-time consume still works
+  engine.setAlarm(wf, 'completion', 1); // past => immediately due
+  const t = engine.tick(wf, { now: 2 });
+  const completionOrder = t.orders.find((o) => o.loop === 'completion');
+  assert.ok(completionOrder, 'completion must fire when idle alarm is due');
+  assert.equal(store.getAlarm(wf, 'completion'), undefined,
+    'claim() must clear alarm_at at claim time');
+});
+
+// ---- Lease ownership at commit (openRun guard) ----
+
+test('openRun: a reaped or superseded run cannot commit', () => {
+  const { engine } = makeEngine([delivery], { reapTtlMs: 0 });
+  const wf = engine.createInstance('delivery');
+
+  // Claim planner as R1 at T=1000
+  const t1 = engine.tick(wf, { now: 1000 });
+  const r1 = t1.orders.find((o) => o.loop === 'planner');
+  assert.ok(r1, 'planner must fire on first tick');
+
+  // Reap at T=1001 (1001-1000=1 > ttl=0 => stale)
+  engine.reap(wf, 1001);
+
+  // Sub-case A: green on reaped run must throw
+  assert.throws(
+    () => engine.green(wf, r1.run, 'plan', { v: 1 }),
+    /no longer holds its lease|reaped or superseded/,
+    'green on a reaped run must throw'
+  );
+
+  // Sub-case B: R2 re-claims; R1 green must still throw
+  const t2 = engine.tick(wf, { now: 2000 });
+  const r2 = t2.orders.find((o) => o.loop === 'planner');
+  assert.ok(r2, 'planner must re-fire after reap');
+  assert.notEqual(r2.run, r1.run, 'R2 must be a distinct run id');
+  assert.throws(
+    () => engine.green(wf, r1.run, 'plan', { v: 1 }),
+    /no longer holds its lease|reaped or superseded/,
+    'green on superseded run must throw even after re-claim'
+  );
+});
+
 // ---- M2-CREATE: createInstance with producedBy persists parent coordinates ----
 
 test('createInstance with producedBy persists parent coordinates and is readable', () => {
