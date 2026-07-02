@@ -74,10 +74,13 @@ performed by the engine without an authority check.
 
 ## §5 Lifecycle states
 
-The five `acceptance` states (§11.3) partition into:
+The six `acceptance` states (§11.3) partition into:
 
 - **debt** = `{ owed, rejected }` — a producer owes work.
 - **settled** = `{ green, retracted, skipped }` — never reads as "stuck".
+- **outstanding** = debt ∪ `{ submitted }` — not a producer's debt, but not done
+  either (§24). Used for completion checks; `submitted` is not itself a debt
+  state, since the producer already discharged its half of the work.
 
 `owed` is declared-but-unbuilt or re-armed. `green` is accepted. `rejected` is
 built-then-judged-unfit (or structurally re-armed). `retracted` is a consumer
@@ -143,7 +146,7 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   (`sealOf = src`); the collection is "complete" when the seal is green.
 - **§11.2 map `src[$i]`** — fan-out: one firing per element, `${INDEX}` bound.
 - **§11.x reduce `src[*]`** — fan-in: see §3.
-- **§11.3** — the five-state lifecycle (above).
+- **§11.3** — the six-state lifecycle (above).
 - **§11.8** — the forward cascade (above).
 - **§11.9** — the three reject kinds (above): judgment, validation (§19), structural.
 
@@ -528,4 +531,208 @@ The machine-green fingerprint covers only `gateStems` (the parent artifacts wire
 
 - **Live cross-instance addressing** (`<step>.<child-path>` syntax) — §4.7 O7.
 - **GC of orphaned children** on parent delete — §4.8 D3.
+
+## §24 Artifact judges (`judges:`)
+
+A `produces` entry can declare one or more **judges**: deterministic
+quality bars an artifact must clear before it counts as done, independent of
+domain review. A judge is not a review step (that stays a normal `consumes:
+[x] → produces: [approval]` node when it's actually domain work, e.g.
+`delivery.yaml`'s `reviewer`); a judge is for criteria that would never merit
+a node of their own — completeness, rigor, tone, format — evaluated by the
+engine's own firing pipeline rather than by a human threading a review step
+into the graph.
+
+Full design record: `docs/proposals/artifact-judge.md` (locked 2026-07-01).
+
+### §24.1 The `submitted` state
+
+A sixth `acceptance` state, `submitted`: the producer has committed a
+schema-valid value, but one or more declared judges haven't all signed off on
+this version yet.
+
+- **Reads as NOT green** for consumers — `isGreen` is `acceptance === 'green'`
+  exactly, unchanged. A `submitted` artifact is invisible to downstream
+  `inputsGreen`/`allGreen` triggers, exactly like `owed`.
+- **Reads as OUTSTANDING for completion** — `OUTSTANDING_STATES = DEBT_STATES
+  ∪ { submitted }` (§5). A workflow is not `done` while any artifact sits in
+  `submitted`, even though the producer itself has no further debt.
+- Artifacts whose `produces` entry declares no `judges:` never enter
+  `submitted` — a plain commit lands `green` exactly as before. This is fully
+  backward compatible: no judges declared, zero behavior change.
+
+### §24.2 A judge is a synthesized `StepDef`
+
+N `judges:` entries on one `produces` entry → N full synthesized `StepDef`s,
+named `${producerStep}.${producedStem}.judges.${judgeName}`. Each judge step:
+
+- `consumes: [judgedStem]` (+ the producer's own `consumes` if `inputs: true`)
+  — this is also how a judge gets `assertAuthority` for free: authority
+  already flows through consume-edges, no new grant needed.
+- `produces: []` — a judge renders its verdict as a `green`/`reject` call
+  against the judged stem, not by producing an artifact of its own.
+- `judges: <judgedStem>` — the marker field that makes it a judge (mirrors
+  `calls:`'s marker-field pattern), read by both layers:
+  `eligibleFirings`/`applyOutcome` (model.ts) and `green()` (engine.ts).
+- Everything else — throttles (`cadence`, `maxRunsPerDay`), retry/timeout,
+  prompt surface (`body`/`bodyFile`/`model`), observability — is inherited
+  from the ordinary `StepDef` shape, not respecified. A judge is not a
+  special-cased mini-pipeline; it is a step.
+
+**Wiring decision**: judges flow through the *normal* step-firing pipeline
+(`eligibleFirings → applySchedule → claim → buildOrder`, plus `reap`), not
+the `calls:`/`maintainCalls` bypass. A `calls:` step is machine-handled and
+never emits a worker order; a judge step *is* worker-fired — it needs a real
+order, a real lease, real retry/timeout, real throttles. Concretely, this is
+a `step.judges` branch directly inside `eligibleFirings` (model.ts), parallel
+to but structurally separate from the `step.calls` early-continue.
+
+### §24.3 The sign-off ledger
+
+`ArtifactData.approvals?: Record<judgeName, version>` — the per-version
+sign-off ledger, present only while relevant (`undefined` once an artifact is
+`green`/`rejected` cleanly, cleared on every reject/retry/fresh-submit).
+
+- **Judge approve**: `approvals[judgeName] = artifact.version`. If every
+  declared judge name now maps to the artifact's *current* version, the
+  artifact transitions `submitted → green`. Otherwise it stays `submitted`
+  with a partial ledger.
+- **Judge reject**: any single reject wins immediately —
+  `submitted → rejected`, bumps `judgmentRejects` **once per submission**
+  (not once per judge), `approvals` cleared. The producer re-arms and, on its
+  next successful commit, gets a fresh ledger (§24.1) — a sibling judge's
+  stale partial approval from the rejected version is never carried forward.
+- **Cascade discipline** (§4.3 of the proposal): an input-move cascade reject
+  on a `submitted` artifact is a **structural** reject (§6), not a judgment —
+  it must NOT bump `judgmentRejects`. `applyOp`'s generic reject-op handling
+  already satisfies this; only the eligibility condition needed widening to
+  admit `submitted` alongside `green` as a cascade-checkable state.
+- **Terminal timing** (§4.8): for a `terminal: true` producer step with
+  judges declared, the terminal flag is applied at judge-**approve** time
+  (the moment `submitted → green` lands), never at producer-commit time. A
+  `submitted` artifact — even a terminal one — must remain re-armable by a
+  judge reject.
+
+### §24.4 CAS and the stale-verdict race
+
+Version bumps happen at producer-submit time (unchanged, §12.2). A judge's
+run fingerprint captures the judged stem's version for free — `claim()`
+already sets `f.inputs = step.consumes.map(c => c.stem)`, and a judge step's
+synthesized `consumes` includes the judged stem, so `r.fingerprint[judgedStem]`
+is populated by the existing machinery with no new capture code.
+
+`judgeCasCheck` (engine.ts, sibling to `casCheck`) checks "the judged stem is
+still `submitted` at the fingerprinted version" before applying a judge's
+verdict:
+
+- If the judged stem moved (producer resubmitted, a human bypassed it, or a
+  sibling judge's reject already settled it) since this judge's order was
+  claimed, the verdict is refused — **born-rejected**, exactly like a stale
+  producer commit (§12.2). The in-flight judge's stale opinion never
+  overwrites a newer submission or double-counts against an
+  already-settled reject.
+- This is symmetric with the producer's own `casCheck` — two independent CAS
+  checks (`casCheck` for producer commits, `judgeCasCheck` for judge verdicts)
+  guard the two different actors that can move a judged artifact.
+
+### §24.5 Judge order failure ≠ judge reject
+
+A judge order that dies (crash, timeout, no verdict rendered) is reaped by
+the ordinary `reap()` path — the task goes back to `idle`, `attempts`
+increments, and the judge re-fires on the next eligible tick. This is a
+**structural** event, identical in kind to any other step's order-failure
+handling; it must never bump `judgmentRejects`. A dead judge order is not an
+opinion about the artifact's quality — it's a fact about worker
+availability, and the two must stay uncorrelated so a flaky judge worker
+cannot exhaust the producer's `maxAttempts` budget on its own.
+
+### §24.6 Human override
+
+Two human-facing bypass points, both reusing the existing `green`/`retry`
+verbs with no new CLI surface:
+
+- **`green(workflow, 'human', path, value)`** — the sentinel run id `'human'`
+  in `Engine.green` skips lease/CAS entirely and does a full bypass:
+  `submitted → green` immediately, ledger irrelevant, regardless of how many
+  judges have or haven't signed off. This is a genuine full override (§4.11
+  of the proposal), not one more ledger slot — a human's judgment supersedes
+  the panel outright. The CLI's `green` command already takes `run` as a
+  required positional argument, so this needs zero new flags:
+  `owenloop green <wf> human <path> --value '{...}'`.
+- **`retry`** — clears `approvals` in addition to the existing counter reset,
+  so a human clearing a judge-reject stall doesn't leave a stale partial
+  ledger for the rebuild to inherit.
+
+### §24.7 `CommitResult['outcome']` — three success outcomes, two failure
+
+`green()`'s result vocabulary grows by two, both **successes**:
+
+- `'submitted'` — the producer's own commit landed in `submitted` because the
+  produce declares judges. Exit code 0; this is the expected outcome for any
+  judged produce's first (or re-)commit, not an error.
+- `'approved'` — a judge recorded its ledger slot, but not all declared
+  judges have signed the current version yet. Also exit code 0.
+- `'green'` — unchanged: either a plain (unjudged) commit, or the *last*
+  judge's approval completing the ledger.
+- `'born-rejected'` / `'schema-rejected'` — unchanged, still the only failure
+  outcomes. The CLI's `case 'green':` handler whitelists these two as the
+  error branch; everything else (including the two new outcomes) is success
+  — a change from the pre-judges CLI, which treated any outcome other than
+  `'green'` as a failure and would have misreported a healthy
+  producer-into-`submitted` commit as an error.
+
+`reject()` grows a matching, smaller vocabulary: `{ outcome: 'rejected' |
+'born-rejected'; reason?: string }` (previously `void`). `'rejected'` is the
+normal case — unchanged behavior, exit 0. `'born-rejected'` is new: a judge's
+verdict lost the CAS race in §24.4 (the judged stem moved since this judge's
+order was claimed) and was refused rather than applied — the judged artifact
+is untouched, `judgmentRejects` is not bumped, and the CLI's `case 'reject':`
+handler (split out from the `retract`/`skip` block it used to share, since
+those two verbs are still `void`) mirrors `green`'s born-rejected branch:
+print the outcome, exit 1. Before this, the CLI discarded `reject()`'s return
+value and always printed `{ok:true}` / exit 0 — a stale judge reject looked
+like success on the wire, exactly the failure `judged-research.yaml`'s
+documented `owenloop reject … --by researcher.report.judges.rigor` usage must
+surface to a scripted caller.
+
+### §24.8 YAML surface
+
+```yaml
+steps:
+  - name: researcher
+    consumes: [question]
+    produces:
+      - name: report
+        schema: { type: object, required: [sections] }  # existing, optional
+        judges:                                          # NEW, optional list
+          - name: completeness
+            body: |
+              Evaluate `report`: every section present, no placeholder or TODO
+              text, every claim carries a citation. If it falls short, reject
+              `report` with the concrete gaps (this re-arms the researcher).
+              Otherwise approve.
+          - name: rigor
+            bodyFile: judges/rigor.md # or a prompt loaded from disk (§16) —
+                                      # body/bodyFile mutually exclusive
+            model: claude-opus-4-8    # optional, per-judge model
+            inputs: true              # optional, default false — judge also
+                                      # reads the producer's inputs (question)
+    maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops
+```
+
+- `name:` — required; keys the sign-off ledger and the audit trail.
+- `body:` / `bodyFile:` — the judge agent's prompt (exactly one required,
+  mutually exclusive, same rule as step bodies). `bodyFile` is resolved
+  against the workflow's base directory and read eagerly at def-load.
+- `model:` — optional model override for that judge's order.
+- `inputs:` — optional, default `false`: the judge sees only the judged value
+  on its own merits; `true` adds read-only consume edges on the producer's
+  inputs, for criteria that need "what was asked for" as context.
+- `cadence:` / `maxRunsPerDay:` — optional throttles, same meaning as on
+  steps; firing is event-driven (on submit), the throttles just cap the rate.
+
+See `examples/workflows/judged-research.yaml` for a runnable end-to-end
+example (mirrors this shape exactly, plus `examples/workflows/judges/rigor.md`
+for the `bodyFile:` case). `delivery.yaml` is deliberately unchanged — PR
+review there is domain work and stays a `reviewer` step.
 - **Fan-out / many-output children** — D1/D2. The v1 one-output rule is enforced.

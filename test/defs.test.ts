@@ -152,7 +152,119 @@ test('buildDef rejects consumes that are not a list of strings', () => {
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
     () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
-    /must be a string or a \{ name, schema \} mapping/,
+    /must be a string or a \{ name, schema, judges \} mapping/,
+  );
+});
+
+// ---- §24 judges: validation (parseJudges / parseProduces) --------------------
+
+test('buildDef rejects a judges: entry missing a name', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'researcher',
+            consumes: ['a'],
+            produces: [{ name: 'report', judges: [{ body: 'evaluate completeness' }] }],
+          },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /produce 'report'\.judges\[0\]\.name must be a string/.test((e as Error).message),
+  );
+});
+
+test('buildDef rejects a judges: entry with both body and bodyFile set', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'researcher',
+            consumes: ['a'],
+            produces: [
+              {
+                name: 'report',
+                judges: [{ name: 'completeness', body: 'inline', bodyFile: 'x.md' }],
+              },
+            ],
+          },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /judge 'completeness': set either body or bodyFile, not both/.test((e as Error).message),
+  );
+});
+
+test('buildDef rejects a judges: entry with neither body nor bodyFile set', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'researcher',
+            consumes: ['a'],
+            produces: [{ name: 'report', judges: [{ name: 'completeness' }] }],
+          },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /judge 'completeness': must set either body or bodyFile/.test((e as Error).message),
+  );
+});
+
+test('buildDef rejects duplicate judge names on the same produce', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'researcher',
+            consumes: ['a'],
+            produces: [
+              {
+                name: 'report',
+                judges: [
+                  { name: 'completeness', body: 'evaluate completeness' },
+                  { name: 'completeness', body: 'evaluate again' },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /produce 'report'\.judges: duplicate judge name 'completeness'/.test((e as Error).message),
+  );
+});
+
+test('buildDef rejects judges: declared on a non-singleton (collection) produce', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'gatherer',
+            consumes: ['a'],
+            produces: [
+              {
+                name: 'items[]',
+                judges: [{ name: 'completeness', body: 'evaluate completeness' }],
+              },
+            ],
+          },
+        ],
+      }),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /produce 'items\[\]': judges: is only supported on singleton produces \(v1\), got a collection produce/.test((e as Error).message),
   );
 });
 
@@ -781,7 +893,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
       inputs: [{ name: 'q' }],
       steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
-    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema \} mapping/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges \} mapping/.test((e as Error).message),
   );
 });
 

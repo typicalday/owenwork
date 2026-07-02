@@ -59,7 +59,7 @@ handles the three things that are tedious to get right:
 ### The mental model: owed, not done
 
 owenloop doesn't track whether a step is "running" or "done." It tracks what each
-step **owes**. Every output is in one of five states:
+step **owes**. Every output is in one of six states:
 
 | state       | still owed? | meaning                                                          |
 |-------------|:-----------:|------------------------------------------------------------------|
@@ -68,6 +68,10 @@ step **owes**. Every output is in one of five states:
 | `rejected`  |     yes     | produced, then judged unfit (or knocked back by a change) — a debt |
 | `retracted` |     no      | a member dropped from a collection; gone for good                 |
 | `skipped`   |     no      | a step declined its own output on a dead branch                   |
+| `submitted` |   no*       | produced, awaiting sign-off from one or more declared judges       |
+
+\* `submitted` isn't a producer debt — the producer already did its job — but the
+workflow isn't done while it sits there either. See [`judges:`](#judges---quality-gates-before-green).
 
 A step is **eligible to run** when it owes a debt (an `owed` or `rejected` output)
 and every input it consumes is `green`. Status is never stored — it's computed from
@@ -203,10 +207,13 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 
-**Exit codes for `green` / `emit` / `seal`:** these exit non-zero when the engine
-refuses the commit (the value was born-rejected or failed its schema). The result JSON
-is always written to stdout; the human-readable reason goes to stderr. A successful
-commit exits 0 — a worker should treat a non-zero exit as a failure, not a success.
+**Exit codes for `green` / `emit` / `seal` / `reject`:** these exit non-zero when the
+engine refuses the commit or verdict (born-rejected, or a schema failure for `green` /
+`emit` / `seal`). `reject` can be born-rejected too — a [judge's](#judges---quality-gates-before-green)
+verdict lands on a stale `submitted` version (a sibling judge already settled it, the
+producer resubmitted, or a human bypassed it) and the CAS guard refuses it. The result
+JSON is always written to stdout; the human-readable reason goes to stderr. A successful
+call exits 0 — a worker should treat a non-zero exit as a failure, not a success.
 
 ### What a job looks like
 
@@ -347,6 +354,67 @@ if nothing consumes it. A stem under `generates:` is deliberately consumed by no
 (an audit log, an external artifact, a stub); lint leaves it alone. Generated artifacts
 are otherwise identical: schema-validated, fingerprinted, greenable, and visible in
 `status`/`show`.
+
+### `judges:` — quality gates before green
+
+A `produces` entry can declare one or more **judges**: deterministic quality
+bars an artifact must clear before it counts as `green`. Use judges for
+criteria that would never merit a review step of their own — completeness,
+rigor, tone, format. If it's actual domain work (a PR review, a legal
+sign-off), that stays a normal step, like `delivery.yaml`'s `reviewer`.
+
+```yaml
+steps:
+  - name: researcher
+    consumes: [question]
+    produces:
+      - name: report
+        schema: { type: object, required: [sections] }  # existing, optional
+        judges:                                          # NEW, optional list
+          - name: completeness
+            body: |
+              Evaluate `report`: every section present, no placeholder or TODO
+              text, every claim carries a citation. If it falls short, reject
+              `report` with the concrete gaps (this re-arms the researcher).
+              Otherwise approve.
+          - name: rigor
+            bodyFile: judges/rigor.md # or a prompt loaded from disk —
+                                      # body/bodyFile mutually exclusive
+            model: claude-opus-4-8    # optional, per-judge model
+            inputs: true              # optional, default false — judge also
+                                      # reads the producer's inputs (question)
+    maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops
+```
+
+Each judge is a real step under the hood — it fires its own worker order
+through the normal pipeline, with its own throttles (`cadence:`,
+`maxRunsPerDay:`) and retry/timeout behavior. When `researcher` commits
+`report`, it lands `submitted` (not `green`) instead — schema-valid, but
+waiting on sign-off. Each judge evaluates it and calls the *same*
+`green`/`reject` verbs you already use, targeted at `report` — no new CLI
+surface. Once every declared judge has approved the current version, `report`
+goes `green`. A single reject sends it straight to `rejected` and re-arms
+`researcher`; a rebuild starts every judge's ledger fresh, so a sibling
+judge's earlier approval never carries over to a new version.
+
+A judge's `reject` is itself CAS-guarded against staleness: if the judged
+artifact has already moved past the version this judge was looking at (a
+sibling judge rejected it first, the producer resubmitted, or a human
+bypassed the ledger), the reject is refused — `born-rejected`, exit code 1 —
+instead of silently corrupting the newer submission's ledger.
+
+A human can always short-circuit the panel:
+
+```bash
+owenloop green $wf human report --value '{"sections":[...],"approvedManually":true}'
+```
+
+The sentinel run id `human` bypasses the ledger outright, regardless of how
+many judges have signed off. See
+[`judged-research.yaml`](examples/workflows/judged-research.yaml) for a
+runnable example, and [`docs/design.md` §24](docs/design.md) for the full
+design (the `submitted` state, the sign-off ledger, the stale-verdict race,
+and how judge order failures are kept separate from judge rejects).
 
 ### `outputs:` — the workflow's interface
 
@@ -530,10 +598,11 @@ npm run typecheck # tsc --noEmit (verifies the source is type-strip-safe)
 npm run check     # both
 ```
 
-The suite is **432 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
+The suite is **448 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
 `util`, `cli`), engine integration tests (the cascade, the stall, schema validation,
-the concurrency check), and **49 end-to-end tests** that spawn the real
-`bin/owenloop.mjs` binary and drive the example workflows through their full lifecycles.
+the concurrency check, `judges:` sign-off/CAS/throttling in `test/judges.test.ts`),
+and end-to-end tests that spawn the real `bin/owenloop.mjs` binary and drive the
+example workflows through their full lifecycles.
 
 Two e2e files carry most of the weight, by opposite intent.
 [`test/edge.e2e.test.ts`](test/edge.e2e.test.ts) is a 26-case edge battery aimed at the

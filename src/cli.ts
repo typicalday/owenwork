@@ -441,6 +441,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           io.out('=== Artifacts ===');
           for (const art of trace.artifacts) {
             io.out(`${art.path}  (${art.acceptance}, v${art.version}, producer: ${art.producer})`);
+            if (art.approvals && Object.keys(art.approvals).length > 0) {
+              const ledger = Object.entries(art.approvals).map(([jn, v]) => `${jn}@v${v}`).join(', ');
+              io.out(`  approvals: ${ledger}`);
+            }
             if (art.events.length === 0) {
               io.out('  (no lifecycle events)');
             } else {
@@ -467,12 +471,17 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
       case 'green': {
         const wf = need(args, 1, 'workflow');
+        // §24: a human bypass (§4.11) passes 'human' in place of a run id — no
+        // lease/CAS applies, see Engine.green's actor-discrimination doc comment.
         const run = need(args, 2, 'run');
         const path = need(args, 3, 'path');
         const value = parseJson(last(args, 'value'));
         const res = engine.green(wf, run, path, value, { terminal: flag(args, 'terminal') });
         print(io, res);
-        if (res.outcome !== 'green') {
+        // §24: 'submitted' (producer commit awaiting judges) and 'approved'
+        // (one judge signed, others still pending) are successful outcomes,
+        // not errors — only 'born-rejected' and 'schema-rejected' are failures.
+        if (res.outcome === 'born-rejected' || res.outcome === 'schema-rejected') {
           io.err(`green ${path}: ${res.outcome}${res.reason ? ' — ' + res.reason : ''}`);
           return 1;
         }
@@ -509,7 +518,24 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         }
         return 0;
       }
-      case 'reject':
+      case 'reject': {
+        const wf = need(args, 1, 'workflow');
+        const path = need(args, 2, 'path');
+        const by = needOpt(args, 'by');
+        const text = needOpt(args, 'text');
+        const rejectRes = engine.reject(wf, path, by, text);
+        print(io, { ok: true, action: 'reject', path, outcome: rejectRes.outcome });
+        // §24.4/§4.6: a judge's reject can itself be born-rejected by the CAS
+        // guard (stale verdict against a submission that already moved on) —
+        // mirror the 'green' handler above: that is a failure, not a success,
+        // and callers scripting against the CLI (e.g. judged-research.yaml)
+        // must see it, not a silent { ok: true }.
+        if (rejectRes.outcome === 'born-rejected') {
+          io.err(`reject ${path}: ${rejectRes.outcome}${rejectRes.reason ? ' — ' + rejectRes.reason : ''}`);
+          return 1;
+        }
+        return 0;
+      }
       case 'retract':
       case 'skip': {
         const wf = need(args, 1, 'workflow');
